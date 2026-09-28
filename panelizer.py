@@ -1,0 +1,3695 @@
+import sys
+import os
+import pcbnew
+from gerber import *
+import kikit
+from kikit import panelize, substrate
+from kikit.panelize import Origin, VECTOR2I
+from kikit.defs import Layer
+from kikit.units import mm, mil
+from kikit.common import *
+from kikit.panel_features.copperFill import SolidCopperFill, HatchedCopperFill, HexCopperFill
+from kikit.substrate import Substrate, NoIntersectionError, TabFilletError, closestIntersectionPoint, biteBoundary
+import numpy as np
+import shapely
+from shapely.geometry import Point, Polygon, MultiPolygon, LineString, GeometryCollection, box
+from shapely import transform, distance, affinity
+import pcbnew
+import math
+from enum import Enum
+import traceback
+import json
+import itertools
+from shootly import *
+from common import *
+from PUI.PySide6 import *
+# from PUI.wx import *
+import PUI
+import wx
+import tempfile
+import atexit
+import shutil
+import psutil
+import re
+from buildexpr import buildexpr
+import gc
+from threading import BoundedSemaphore, Event, Lock, Thread, current_thread
+from pcb_open import open_pcb_file
+from panelizer_freekicad import (
+    FREEKICAD_LAYER_NAME,
+    prepare_panel_freekicad_sources,
+)
+
+BUILDEXPR = "BUILDEXPR"
+
+MAX_BOARD_SIZE = 10000*mm
+MIN_SPACING = 0.0
+VC_EXTENT = 3
+HOLE_HANDLE_SIZE = 8
+HOLE_HANDLE_HIT_RADIUS = 8
+HOLE_INSERT_DRAG_THRESHOLD = 3
+MIN_SHAPELY_VERSION = (2, 0, 7)
+OUTLINE_CHAINING_EPSILON_MM = getattr(pcbnew, "DEFAULT_CHAINING_EPSILON_MM", 0.01)
+OUTLINE_CHAINING_EPSILON = round(OUTLINE_CHAINING_EPSILON_MM * pcbnew.PCB_IU_PER_MM)
+
+
+def workaround_panel_save(self, reconstructArcs=False, refillAllZones=False,
+                          edgeWidth=panelize.fromMm(0.1)):
+    panelEdges = self.boardSubstrate.serialize(reconstructArcs)
+    boardsEdges = self._getRefillEdges(reconstructArcs)
+
+    for e in panelEdges:
+        e.SetWidth(edgeWidth)
+    for e in boardsEdges:
+        e.SetWidth(edgeWidth)
+
+    self._validateVCuts()
+    vcuts = self._renderVCutH() + self._renderVCutV()
+    keepouts = []
+    for cut, clearanceArea in vcuts:
+        self.board.Add(cut)
+        if clearanceArea is not None:
+            keepouts.append(self.addKeepout(clearanceArea))
+
+    for edge in boardsEdges:
+        self.board.Add(edge)
+
+    originalZoneNames = {}
+    for i, zone in enumerate(self.zonesToRefill):
+        newName = f"KIKIT_zone_{i}"
+        originalZoneNames[newName] = zone.GetZoneName()
+        zone.SetZoneName(newName)
+
+    # KiCad 10.0.x can crash in SETTINGS_MANAGER::SaveProjectAs() when
+    # BOARD.Save() is used here from Python. The board file itself is written,
+    # but project-settings saving may segfault or bus-error. KiKit immediately
+    # transfers project settings explicitly below, so skip settings only for
+    # this first intermediate save.
+    pcbnew.SaveBoard(self.filename, self.board, True)
+    self.transferProjectSettings()
+
+    for cut, _ in vcuts:
+        self.board.Remove(cut)
+    for keepout in keepouts:
+        self.board.Remove(keepout)
+    for edge in panelEdges:
+        self.board.Remove(edge)
+
+    panelize.reloadProject(self.getProFilepath())
+    fillBoard = pcbnew.LoadBoard(self.filename)
+    fillerTool = pcbnew.ZONE_FILLER(fillBoard)
+    if refillAllZones:
+        fillerTool.Fill(fillBoard.Zones())
+
+    for edge in panelize.collectEdges(fillBoard, Layer.Edge_Cuts):
+        fillBoard.Remove(edge)
+    for edge in panelEdges:
+        fillBoard.Add(edge)
+    if self.vCutSettings.layer == Layer.Edge_Cuts:
+        vcuts = self._renderVCutH() + self._renderVCutV()
+        for cut, _ in vcuts:
+            fillBoard.Add(cut)
+
+    zonesToRefill = pcbnew.ZONES()
+    for zone in fillBoard.Zones():
+        zName = zone.GetZoneName()
+        if zName.startswith("KIKIT_zone_"):
+            zonesToRefill.append(zone)
+            zone.SetZoneName(originalZoneNames[zName])
+    if len(zonesToRefill) > 0:
+        fillerTool.Fill(zonesToRefill)
+
+    fillBoard.Save(self.filename)
+
+    self._adjustPageSize()
+    self.makeLayersVisible()
+    self.transferProjectSettings()
+    self.writeCustomDrcRules()
+
+
+panelize.Panel.save = workaround_panel_save
+
+
+def patched_getOriginCoord(origin, bBox):
+    """Returns real coordinates (VECTOR2I) of the origin for given bounding box"""
+    if origin is None:
+        return VECTOR2I(0, 0)
+    if origin == Origin.Center:
+        return VECTOR2I(bBox.GetX() + bBox.GetWidth() // 2,
+                        bBox.GetY() + bBox.GetHeight() // 2)
+    if origin == Origin.TopLeft:
+        return VECTOR2I(bBox.GetX(), bBox.GetY())
+    if origin == Origin.TopRight:
+        return VECTOR2I(bBox.GetX() + bBox.GetWidth(), bBox.GetY())
+    if origin == Origin.BottomLeft:
+        return VECTOR2I(bBox.GetX(), bBox.GetY() + bBox.GetHeight())
+    if origin == Origin.BottomRight:
+        return VECTOR2I(bBox.GetX() + bBox.GetWidth(), bBox.GetY() + bBox.GetHeight())
+
+panelize.getOriginCoord = patched_getOriginCoord
+
+def panelizer_warning_prefix(exc):
+    for frame in reversed(traceback.extract_tb(exc.__traceback__)):
+        if os.path.abspath(frame.filename) == os.path.abspath(__file__):
+            return f"[Panelizer:L{frame.lineno}] "
+    return "[Panelizer] "
+
+
+def read_constraint_profile(kicad_file):
+    if not kicad_file:
+        return None
+    project_file = os.path.splitext(kicad_file)[0] + ".kicad_pro"
+    try:
+        with open(project_file, encoding="utf-8") as f:
+            project = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    rules = project.get("board", {}).get("design_settings", {}).get("rules")
+    if not isinstance(rules, dict):
+        return None
+
+    return rules
+
+
+def same_constraint_profile(a, b):
+    return json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
+
+
+def copy_constraint_profile(source_kicad_file, target_kicad_file):
+    rules = read_constraint_profile(source_kicad_file)
+    if rules is None:
+        return False
+
+    target_project_file = os.path.splitext(target_kicad_file)[0] + ".kicad_pro"
+    try:
+        with open(target_project_file, encoding="utf-8") as f:
+            target_project = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+
+    target_project.setdefault("board", {}).setdefault("design_settings", {})["rules"] = rules
+
+    with open(target_project_file, "w", encoding="utf-8") as f:
+        json.dump(target_project, f, indent=2)
+    return True
+
+
+def patched_extractRings(geometryList):
+    """
+    KiCad accepts tiny discontinuities when chaining board outlines. KiKit's
+    default extractRings requires stricter endpoint equality, so use KiCad's
+    chaining epsilon here before KiKit converts the rings to Shapely polygons.
+    """
+    def point_distance_sq(a, b):
+        dx = a[0] - b[0]
+        dy = a[1] - b[1]
+        return dx * dx + dy * dy
+
+    def canonical_point(point, points):
+        point = (point[0], point[1])
+        nearest = None
+        nearest_dist = None
+        max_dist = OUTLINE_CHAINING_EPSILON * OUTLINE_CHAINING_EPSILON
+        for candidate in points:
+            dist = point_distance_sq(point, candidate)
+            if dist <= max_dist and (nearest_dist is None or dist < nearest_dist):
+                nearest = candidate
+                nearest_dist = dist
+        if nearest is not None:
+            return nearest
+        points.append(point)
+        return point
+
+    coincidencePoints = {}
+    canonicalPoints = []
+    invalidGeometry = []
+    for i, geom in enumerate(geometryList):
+        if not substrate.isValidPcbShape(geom):
+            invalidGeometry.append(i)
+            continue
+        start = canonical_point(substrate.getStartPoint(geom), canonicalPoints)
+        coincidencePoints.setdefault(start, substrate.CoincidenceList()).append(i)
+        end = canonical_point(substrate.getEndPoint(geom), canonicalPoints)
+        coincidencePoints.setdefault(end, substrate.CoincidenceList()).append(i)
+
+    for point, items in coincidencePoints.items():
+        l = len(items)
+        if l == 1:
+            raise substrate.PositionError("Discontinuous outline at [{}, {}]. This may have several causes:\n" +
+                                          "    - The outline in really discontinuous. Check the coordinates in your source board.\n" +
+                                          "    - You haven't included all the outlines or in the case of multi-design,\n" +
+                                          "      you have included a part of outline from a neighboring board.",
+                                          point)
+        if l == 2:
+            continue
+        raise substrate.PositionError("Multiple outlines ({}) at [{{}}, {{}}]".format(l), point)
+
+    def findRing(startIdx, unused):
+        unused[startIdx] = False
+        ring = [startIdx]
+        start = canonical_point(substrate.getStartPoint(geometryList[startIdx]), canonicalPoints)
+        end = canonical_point(substrate.getEndPoint(geometryList[startIdx]), canonicalPoints)
+        if start == end:
+            return ring
+        currentPoint = end
+        while True:
+            nextIdx = coincidencePoints[currentPoint].getNeighbor(ring[-1])
+            assert unused[nextIdx] or nextIdx == startIdx
+            nextStart = canonical_point(substrate.getStartPoint(geometryList[nextIdx]), canonicalPoints)
+            nextEnd = canonical_point(substrate.getEndPoint(geometryList[nextIdx]), canonicalPoints)
+            currentPoint = nextEnd if currentPoint == nextStart else nextStart
+            unused[nextIdx] = False
+            if nextIdx == startIdx:
+                return ring
+            ring.append(nextIdx)
+
+    rings = []
+    unused = [True] * len(geometryList)
+    for invalidIdx in invalidGeometry:
+        unused[invalidIdx] = False
+    while any(unused):
+        rings.append(findRing(substrate.getUnused(unused), unused))
+    return rings
+
+
+substrate.extractRings = patched_extractRings
+
+
+def version_tuple(version):
+    parts = [int(part) for part in re.split(r"\D+", version)[:3] if part]
+    if not parts:
+        return None
+    return tuple(parts)
+
+
+class Tool(Enum):
+    END = -1
+    NONE = 0
+    TAB = 1
+    HOLE = 2
+
+
+class Direction(Enum):
+    Up = 0
+    Down = 1
+    Left = 2
+    Right = 3
+
+def extrapolate(x1, y1, x2, y2, r, d):
+    dx = x2 - x1
+    dy = y2 - y1
+    n = math.sqrt(dx*dx + dy*dy)
+    if n == 0:
+        return x1, y1
+    l = n*r + d
+    return x1 + dx*l/n, y1 + dy*l/n
+
+
+def is_straight_line(line, tolerance=SHP_EPSILON):
+    coords = list(line.coords)
+    if len(coords) <= 2:
+        return True
+    x1, y1 = coords[0]
+    x2, y2 = coords[-1]
+    dx = x2 - x1
+    dy = y2 - y1
+    length = math.sqrt(dx*dx + dy*dy)
+    if length == 0:
+        return False
+    for x, y in coords[1:-1]:
+        if abs(dx * (y1 - y) - (x1 - x) * dy) / length > tolerance:
+            return False
+    return True
+
+
+class PCBFile:
+    def __init__(self, main, boardpath, subboard=None, autoload=True):
+        self.main = main
+        self.error = None
+        boardpath = os.path.expanduser(boardpath)
+
+        if os.path.isfile(boardpath):
+            dirpath = os.path.dirname(boardpath)
+            if is_gerber_dir(dirpath):
+                boardpath = dirpath
+
+        boardpath = os.path.realpath(boardpath)
+        self.file = boardpath
+        self.subboard = subboard
+        self.mtime = self.get_mtime()
+        if autoload:
+            self.load()
+
+    def get_mtime(self):
+        try:
+            return os.path.getmtime(self.file)
+        except OSError:
+            return None
+
+    def load(self):
+        self.error = None
+        self.file_type = None
+        self.outline_file = None
+        self.kicad_file = None
+        self.constraint_profile = None
+        self.board_thickness = 0
+        self.copper_layer_count = 0
+        self.orig = (0, 0)
+        self._shapes = []
+        self.width = 0
+        self.height = 0
+        self.subboards = 1
+        self.subboards_bbox = []
+
+        folder = os.path.basename(os.path.dirname(self.file))
+        name = os.path.splitext(os.path.basename(self.file))[0]
+        if folder != name:
+            name = os.path.join(folder, name)
+        self.ident = name
+        if self.subboard is not None:
+            self.ident = f"{self.ident}[{self.subboard[1]}]"
+
+        self.avail_options = {}
+        self.avail_flags = []
+        self.errors = []
+
+        if self.file.lower().endswith(".kicad_pcb"):
+            self.file_type = "kicad"
+            self.outline_file = self.file
+            self.kicad_file = self.file
+        elif is_gerber(self.file):
+            self.file_type = "gerber"
+            self.outline_file = os.path.join(self.main.temp_dir, f"{id(self)}_outline.kicad_pcb")
+            self.kicad_file = os.path.join(self.main.temp_dir, f"{id(self)}_full.kicad_pcb")
+            convert_to_kicad(self.file, self.outline_file, outline_only=True)
+
+        self.constraint_profile = read_constraint_profile(self.kicad_file)
+
+        if self.file_type is None:
+            self.error = f"{self.ident}: Unsupported board file"
+            return
+        if not os.path.exists(self.outline_file):
+            self.error = f"{self.ident}: File not found: {self.file}"
+            return
+
+        orig_x = None
+        orig_y = None
+        board = pcbnew.LoadBoard(self.outline_file)
+        if board is None:
+            self.error = f"{self.ident}: Failed to load board"
+            return
+        self.board_thickness = board.GetDesignSettings().GetBoardThickness()
+        self.copper_layer_count = board.GetCopperLayerCount()
+        for draw in board.GetDrawings():
+            if draw.GetLayer() == pcbnew.Edge_Cuts:
+                width = draw.GetWidth()
+                ox = draw.GetBoundingBox().GetX() + width/2
+                oy = draw.GetBoundingBox().GetY() + width/2
+                orig_x = min(orig_x, ox) if orig_x is not None else ox
+                orig_y = min(orig_y, oy) if orig_y is not None else oy
+        self.orig = (orig_x, orig_y)
+
+        panel = panelize.Panel(os.path.join(self.main.temp_dir, "temp.kicad_pcb"))
+        try:
+            if self.subboard is None:
+                panel.appendBoard(
+                    self.outline_file,
+                    pcbnew.VECTOR2I(0, 0),
+                    origin=panelize.Origin.TopLeft,
+                    tolerance=panelize.fromMm(1),
+                    rotationAngle=pcbnew.EDA_ANGLE(0, pcbnew.DEGREES_T),
+                    inheritDrc=False
+                )
+            else:
+                import traceback
+                traceback.print_exc()
+                sourceArea = self.subboard[0].subboards_bbox[self.subboard[1]]
+                buffered = shpBBoxExpand(sourceArea, 1*mm)
+                panel.appendBoard(
+                    self.outline_file,
+                    pcbnew.VECTOR2I(0, 0),
+                    sourceArea=shpBoxToRect(buffered),
+                    shrink=True,
+                    origin=panelize.Origin.TopLeft,
+                    tolerance=panelize.fromMm(1),
+                    rotationAngle=pcbnew.EDA_ANGLE(0, pcbnew.DEGREES_T),
+                    inheritDrc=False
+                )
+            s = panel.substrates[0]
+
+            if isinstance(s.substrates, MultiPolygon):
+                self._shapes = list(s.substrates.geoms)
+                if self.subboard is None:
+                    panel = panelize.Panel(os.path.join(self.main.temp_dir, "temp.kicad_pcb"))
+                    panel.appendBoard(
+                        self.outline_file,
+                        pcbnew.VECTOR2I(0, 0),
+                        origin=None,
+                        tolerance=panelize.fromMm(1),
+                        rotationAngle=pcbnew.EDA_ANGLE(0, pcbnew.DEGREES_T),
+                        inheritDrc=False
+                    )
+                    self.subboards_bbox = [s.bounds for s in panel.substrates[0].substrates.geoms]
+                    self.subboards = len(self.subboards_bbox)
+                else:
+                    self._shapes = [self._shapes[0]]
+            elif isinstance(s.substrates, Polygon):
+                self._shapes = [s.substrates]
+            else:
+                self._shapes = []
+
+            if self.subboards == 1:
+                bbox = self._shapes[0].bounds
+                self.width = bbox[2] - bbox[0]
+                self.height = bbox[3] - bbox[1]
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.error = str(e).replace(self.outline_file, os.path.basename(self.file))
+            self._shapes = []
+            self.width = 0
+            self.height = 0
+            raise e
+
+        if self.file_type == "kicad":
+            for fp in board.GetFootprints():
+                if fp.HasField(BUILDEXPR):
+                    expr = fp.GetFieldText(BUILDEXPR)
+                    if expr:
+                        try:
+                            buildexpr(expr, {})
+
+                            flags = [t.strip() for t in re.split("[|&()~]", expr)]
+                            flags = [f for f in flags if f]
+                            for f in flags:
+                                if f not in self.avail_flags:
+                                    self.avail_flags.append(f)
+                                    self.avail_flags.sort()
+                        except:
+                            self.errors.append(f"{self.ident}: Invalid buildexpr {repr(expr)}")
+
+                for k,v in fp.GetFieldsText().items():
+                    if "#" in k and v:
+                        try:
+                            tags = [t.strip() for t in k.split("#")[1:]]
+                            for f in tags:
+                                if "=" in f:
+                                    k, v = f.split("=")
+                                    if k not in self.avail_options:
+                                        self.avail_options[k] = []
+                                    if v not in self.avail_options[k]:
+                                        self.avail_options[k].append(v)
+                                        self.avail_options[k].sort()
+                                else:
+                                    if f not in self.avail_flags:
+                                        self.avail_flags.append(f)
+                                        self.avail_flags.sort()
+                        except:
+                            self.errors.append(f"{self.ident}: Invalid field {k}: {repr(v)}")
+
+
+class PanelCell(StateObject):
+    def __init__(self, main, pcb_file):
+        super().__init__()
+        self.main = main
+        self.pcb_file = pcb_file
+
+        if self.file_type == "gerber":
+            self.kicad_file = os.path.join(self.main.temp_dir, f"{id(self)}_full.kicad_pcb")
+        else:
+            self.kicad_file = self.pcb_file.kicad_file
+
+        self.x = 0
+        self.y = 0
+        self.tolerance = 1
+        self.margin_left = 0
+        self.margin_right = 0
+        self.margin_top = 0
+        self.margin_bottom = 0
+        self.rotate = 0
+        self._tabs = []
+        self.build_options = defaultdict(str)
+        self.build_flags = []
+        self.permanent_errors = []
+        self.fp_count = 0
+        self.bom_file = ""
+        self.cpl_file = ""
+
+    @property
+    def file(self):
+        return self.pcb_file.file
+
+    @property
+    def file_type(self):
+        return self.pcb_file.file_type
+
+    @property
+    def outline_file(self):
+        return self.pcb_file.outline_file
+
+    @property
+    def board_thickness(self):
+        return self.pcb_file.board_thickness
+
+    @property
+    def copper_layer_count(self):
+        return self.pcb_file.copper_layer_count
+
+    @property
+    def constraint_profile(self):
+        return self.pcb_file.constraint_profile
+
+    @property
+    def orig(self):
+        return self.pcb_file.orig
+
+    @property
+    def width(self):
+        return self.pcb_file.width
+
+    @property
+    def height(self):
+        return self.pcb_file.height
+
+    @property
+    def error(self):
+        return self.pcb_file.error
+
+    @property
+    def ident(self):
+        return self.pcb_file.ident
+
+    @property
+    def avail_options(self):
+        return self.pcb_file.avail_options
+
+    @property
+    def avail_flags(self):
+        return self.pcb_file.avail_flags
+
+    @property
+    def errors(self):
+        return self.pcb_file.errors
+
+    def transform(self, shape):
+        shape = affinity.rotate(shape, (self.rotate % 360)*-1, origin=(0,0))
+        shape = transform(shape, lambda x: x+[self.x+self.main.off_x, self.y+self.main.off_y])
+        return shape
+
+    @property
+    def shapes(self):
+        """
+        Return shapes in global coordinate system
+        """
+        ret = []
+        for shape in self.pcb_file._shapes:
+            ret.append(self.transform(shape))
+        return ret
+
+    def tabs(self):
+        """
+        Return tab anchors in global coordinate system
+        """
+        ret = []
+        for tab in self._tabs:
+            p = self.transform(Point(tab["x"], tab["y"]))
+            arrow = None
+
+            if tab["closest"]:
+                for shape in self.shapes:
+                    s = shapely.shortest_line(p, shape.exterior)
+                    if arrow is None or s.length < arrow.length:
+                        arrow = s
+            else:
+                touch = shoot(
+                    p,
+                    shapely.union_all(self.shapes),
+                    affinity.rotate(
+                        LineString([(0,0), (0, -1)]),
+                        tab["direction"],
+                        origin=(0,0)
+                    ).coords[1],
+                    arrow_size=0
+                )[0]
+                arrow = LineString([p, touch])
+
+            if arrow:
+                t0 = arrow.coords[0]
+                t1 = arrow.coords[1]
+                ret.append({
+                    "x1": t0[0],
+                    "y1": t0[1],
+                    "x2": t1[0],
+                    "y2": t1[1],
+                    "width": tab["width"],
+                    "o": tab,
+                })
+        return ret
+
+    def clone(self):
+        pcb = PanelCell(self.main, self.pcb_file)
+        pcb.rotate = self.rotate
+        pcb.tolerance = self.tolerance
+        pcb.margin_left = self.margin_left
+        pcb.margin_right = self.margin_right
+        pcb.margin_top = self.margin_top
+        pcb.margin_bottom = self.margin_bottom
+        pcb._tabs = [StateDict({**tab}) for tab in self._tabs]
+        return pcb
+
+    def contains(self, p):
+        for shape in self.shapes:
+            if shape.contains(p):
+                return True
+        return False
+
+    def distance(self, obj):
+        mdist = None
+        if isinstance(obj, PanelCell):
+            objs = obj.shapes
+        else:
+            objs = [obj]
+        for shape, obj in itertools.product(self.shapes, objs):
+            dist = distance(shape, obj)
+            if mdist is None:
+                mdist = dist
+            else:
+                mdist = min(mdist, dist)
+        return mdist
+
+    def directional_distance(self, obj, direction):
+        mdist = None
+        if isinstance(obj, PanelCell):
+            objs = obj.shapes
+        else:
+            objs = [obj]
+        for shape, obj in itertools.product(self.shapes, objs):
+            c = collision(shape, obj, direction, arrow_size=MAX_BOARD_SIZE)
+            if c:
+                dist = LineString(c).length
+                if mdist is None:
+                    mdist = dist
+                else:
+                    mdist = min(mdist, dist)
+        return mdist
+
+    def rotateBy(self, deg=90):
+        x, y = self.center
+        self.rotate = self.rotate + deg
+        self.setCenter((x, y))
+
+    def setTop(self, top):
+        x1, y1, x2, y2 = self.bbox
+        self.y = self.y - y1 + top
+
+    def setBottom(self, bottom):
+        x1, y1, x2, y2 = self.bbox
+        self.y = self.y - y2 + bottom
+
+    def setLeft(self, left):
+        x1, y1, x2, y2 = self.bbox
+        self.x = self.x - x1 + left
+
+    def setRight(self, right):
+        x1, y1, x2, y2 = self.bbox
+        self.x = self.x - x2 + right
+
+    @property
+    def center(self):
+        p = Polygon([(0, 0), (self.width, 0), (self.width, self.height), (0, self.height)])
+        p = affinity.rotate(p, self.rotate*-1, origin=(0,0))
+        b = p.bounds
+        x1, y1, x2, y2 = self.x+b[0], self.y+b[1], self.x+b[2], self.y+b[3]
+        return (x1+x2)/2, (y1+y2)/2
+
+    def setCenter(self, value):
+        x0, y0 = self.center
+        self.x = self.x - x0 + value[0]
+        self.y = self.y - y0 + value[1]
+
+    @property
+    def rwidth(self):
+        x1, y1, x2, y2 = self.bbox
+        return x2 - x1
+
+    @property
+    def rheight(self):
+        x1, y1, x2, y2 = self.bbox
+        return y2 - y1
+
+    @property
+    def bbox(self):
+        p = MultiPolygon(self.shapes)
+        return p.bounds
+
+    def addTab(self, x, y):
+        p = affinity.rotate(Point(x - self.x - self.main.off_x, y - self.y - self.main.off_y), self.rotate*1, origin=(0,0))
+        self._tabs.append(StateDict({
+            "x": p.x,
+            "y": p.y,
+            "width": self.main.state.tab_width,
+            "closest": True,
+            "direction": 0.0,
+        }))
+
+
+class Hole(StateObject):
+    def __init__(self, main, coords):
+        super().__init__()
+        polygon = Polygon(coords)
+        b = polygon.bounds
+        self.main = main
+        self.x = b[0]
+        self.y = b[1]
+        self._polygon = transform(polygon, lambda x: x-[self.x, self.y])
+
+    @property
+    def polygon(self):
+        return transform(self._polygon, lambda x: x+[self.x+self.main.off_x, self.y+self.main.off_y])
+
+    @property
+    def vertices(self):
+        return list(self.polygon.exterior.coords)[:-1]
+
+    def _set_vertices(self, vertices):
+        if len(vertices) < 3:
+            return False
+
+        polygon = Polygon(vertices)
+        if polygon.is_empty or polygon.area <= 0 or not polygon.is_valid:
+            return False
+
+        offset_x = self.x + self.main.off_x
+        offset_y = self.y + self.main.off_y
+        self._polygon = Polygon([
+            (x - offset_x, y - offset_y)
+            for x, y in vertices
+        ])
+        return True
+
+    def insert_vertex(self, edge_index, point):
+        vertices = self.vertices
+        vertices.insert(edge_index + 1, point)
+        return self._set_vertices(vertices)
+
+    def move_vertex(self, vertex_index, point):
+        vertices = self.vertices
+        if vertices[vertex_index] == point:
+            return False
+        vertices[vertex_index] = point
+        return self._set_vertices(vertices)
+
+    def remove_vertex(self, vertex_index):
+        vertices = self.vertices
+        if len(vertices) <= 3:
+            return False
+        del vertices[vertex_index]
+        return self._set_vertices(vertices)
+
+    def contains(self, p):
+        return self.polygon.contains(p)
+
+def makeSpanningPoints(boardSubstrate, base_shape, origin, outward_direction, width):
+    if boardSubstrate.substrates.contains(Point(origin)) and not boardSubstrate.substrates.boundary.contains(Point(origin)):
+        print(origin, outward_direction, ["Tab annotation is placed inside the board. It has to be on edge or outside the board."])
+        return None
+
+    boardSubstrate.orient()
+
+    outward_direction = normalize(outward_direction)
+    direction_epsilon = outward_direction * float(SHP_EPSILON)
+    origin -= direction_epsilon
+    sideOriginA = origin + makePerpendicular(outward_direction) * width / 2
+    sideOriginB = origin - makePerpendicular(outward_direction) * width / 2
+
+    # snap to board edge
+    borderA = LineString([sideOriginA - outward_direction * MAX_BOARD_SIZE / 2, sideOriginA + outward_direction * MAX_BOARD_SIZE / 2])
+    borderB = LineString([sideOriginB - outward_direction * MAX_BOARD_SIZE / 2, sideOriginB + outward_direction * MAX_BOARD_SIZE / 2])
+    pointsOnBorderA = intersection(borderA, base_shape.exterior)
+    if pointsOnBorderA.is_empty:
+        print("Points on border A is empty")
+        return None
+    pointsOnBorderB = intersection(borderB, base_shape.exterior)
+    if pointsOnBorderB.is_empty:
+        print("Points on border B is empty")
+        return None
+    origin = Point(*origin)
+    sideOriginA = shapely.shortest_line(pointsOnBorderA, origin).coords[0] + direction_epsilon * 2
+    sideOriginB = shapely.shortest_line(pointsOnBorderB, origin).coords[0] + direction_epsilon * 2
+    return sideOriginA, sideOriginB
+
+# Modified from tab() in kikit:
+# 1. Don't stop at first hit substrate, it may not be the closest one
+# 2. Fix origin inside a hole
+# 3. Better handling of non-perpendicular approaching angle
+def autotabs(boardSubstrate, sideOriginA, sideOriginB, direction,
+            maxHeight=pcbnew.FromMM(50), fillet=0):
+    """
+    Create a tab for the substrate. The tab starts at the specified origin
+    (2D point) and tries to penetrate existing substrate in direction (a 2D
+    vector). The tab is constructed with given width. If the substrate is
+    not penetrated within maxHeight, exception is raised.
+
+    When partitionLine is specified, the tab is extended to the opposite
+    side - limited by the partition line. Note that if tab cannot span
+    towards the partition line, then the tab is not created - it returns a
+    tuple (None, None).
+
+    If a fillet is specified, it allows you to add fillet to the tab of
+    specified radius.
+
+    Returns a pair tab and cut outline. Add the tab it via union - batch
+    adding of geometry is more efficient.
+    """
+
+    boardSubstrate.orient()
+
+    direction = normalize(direction)
+    direction_epsilon = direction * float(SHP_EPSILON)
+
+    tabs = []
+
+    for geom in listGeometries(boardSubstrate.substrates):
+        try:
+            boundary = geom.exterior
+            splitPointA = closestIntersectionPoint(sideOriginA, direction,
+                boundary, maxHeight)
+            splitPointB = closestIntersectionPoint(sideOriginB, direction,
+                boundary, maxHeight)
+            tabFace = biteBoundary(boundary, splitPointB, splitPointA)
+
+            tab = Polygon([p + direction_epsilon for p in tabFace.coords] + [sideOriginA, sideOriginB])
+            tabs.append(boardSubstrate._makeTabFillet(tab, tabFace, fillet))
+        except NoIntersectionError as e:
+            pass
+        except TabFilletError as e:
+            pass
+
+        for boundary in geom.interiors:
+            try:
+                splitPointA = closestIntersectionPoint(sideOriginA, direction,
+                    boundary, maxHeight)
+                splitPointB = closestIntersectionPoint(sideOriginB, direction,
+                    boundary, maxHeight)
+                tabFace = biteBoundary(boundary, splitPointB, splitPointA)
+
+                tab = Polygon([p + direction_epsilon for p in tabFace.coords] + [sideOriginA, sideOriginB])
+                tabs.append(boardSubstrate._makeTabFillet(tab, tabFace, fillet))
+            except NoIntersectionError as e:
+                pass
+            except TabFilletError as e:
+                pass
+    return tabs
+
+def autotab(boardSubstrate, sideOriginA, sideOriginB, direction,
+            maxHeight=pcbnew.FromMM(50), fillet=0):
+    tabs = autotabs(boardSubstrate, sideOriginA, sideOriginB, direction, maxHeight, fillet)
+    if tabs:
+        tabs = [(tab[0].area, tab) for tab in tabs]
+        tabs.sort(key=lambda t: t[0])
+        return tabs[0][1]
+    return None
+
+class PanelizerUI(Application):
+    def __init__(self):
+        # pcbnew my crash with "./src/common/stdpbase.cpp(59): assert ""traits"" failed in Get(): create wxApp before calling this" without this
+        # Be aware that this will break atexit
+        # self.wx_app = wx.App()
+
+        super().__init__(icon=resource_path("icon.ico"))
+
+        self.temp_dir = tempfile.mkdtemp(prefix="kikakuka_panelizer_")
+        self._background_stop = Event()
+        self._build_request_lock = Lock()
+        self._build_requests = []
+        self._build_semaphore = BoundedSemaphore(1)
+        self._build_semaphore.acquire()
+        atexit.register(self.cleanup)
+
+        self.unit = mm
+        self.off_x = 0
+        self.off_y = 0
+
+        self.flag_need_update = False
+
+        self.state = State()
+        self.state.crosshair = None
+        self.state.hide_outside_reference_value = True
+
+        self.state.debug = False
+        self.state.debug_bbox = True
+
+        self.state.redraw = 0
+        self.state.show_conflicts = True
+        self.state.show_pcb = True
+        self.state.show_hole = True
+        self.state.show_mb = True
+        self.state.show_vc = True
+
+        self.state.pcb = []
+        self.pcb_files = {}
+        self.state.scale = None
+        self.canvas_width = None
+        self.canvas_height = None
+
+        self.state.target_path = ""
+        self.state.export_path = ""
+        self.state.last_exported_path = ""
+
+        self.state.focus = None
+        self.state.focus_tab = None
+
+        self.state.vcuts = []
+        self.state.bites = []
+        self.state.dbg_points = []
+        self.state.dbg_rects = []
+        self.state.dbg_polygons = []
+        self.state.dbg_text = []
+        self.state.substrates = []
+        self.state.holes = []
+        self.state.conflicts = []
+        self.state.errors = []
+        self.state.warnings = []
+
+        self.state.boardSubstrate = None
+
+        self.state.move = 0
+        self.state.mousepos = None
+        self.mouse_dragging = None
+        self.mousehold = False
+        self.mousemoved = 0
+        self.mouse_action_from_inside = False
+        self.hole_handle_drag = None
+        self.hole_double_click_handled = False
+        self.tool = Tool.NONE
+        self.state.edit_polygon = None
+
+        self.set_defaults()
+
+        self._build_worker = Thread(
+            target=self.build_worker,
+            name="panelizer-build-worker",
+            daemon=True,
+        )
+        self._build_worker.start()
+        self._pcb_file_watcher = Thread(
+            target=self.watch_pcb_files,
+            name="panelizer-pcb-file-watcher",
+            daemon=True,
+        )
+        self._pcb_file_watcher.start()
+
+    def set_defaults(self):
+        self.state.netRenamePattern = "B{n}-{orig}"
+        self.state.refRenamePattern = "B{n}-{orig}"
+
+        self.state.use_frame = True
+        self.state.frame_pcb = None
+        self.state.tight = True
+        self.state.auto_tab = True
+        self.state.spacing = 1.6
+        self.state.max_tab_spacing = 50.0
+        self.state.cut_method = "vc_or_mb"
+        self.state.mb_diameter = 0.6
+        self.state.mb_spacing = round(0.3 + self.state.mb_diameter, 1)
+        self.state.mb_offset = 0.0
+        mb_count = 5
+        self.state.tab_width = math.ceil((self.state.mb_spacing * (mb_count-1)) * 10) / 10
+        self.state.vc_layer = "Cmts.User"
+        self.state.merge_vcuts = True
+        self.state.merge_vcuts_threshold = 0.4
+        self.state.frame_width = 100
+        self.state.frame_height = 100
+        self.state.frame_top = 5
+        self.state.frame_bottom = 5
+        self.state.frame_left = 0
+        self.state.frame_right = 0
+        self.state.mill_fillets = 0.5
+        self.state.export_mill_fillets = False
+
+        self.state.frame_tooling_holes = True
+        self.state.frame_tooling_horizontal_offset = 3.5
+        self.state.frame_tooling_vertical_offset = 3.5
+        self.state.frame_tooling_diameter = 1.152
+        self.state.frame_tooling_solder_mask_opening_diameter = 1.3
+
+        self.state.fiducials = True
+        self.state.fiducials_layer = "Both"
+        self.state.fiducials_clearance = 3.35
+        self.state.fiducials_diameter = 1.0
+        self.state.fiducials_solder_mask_opening_diameter = 2.0
+
+        self.state.copperfill = "None" # None, Solid, Hatched, Hex
+        self.state.copperfill_layer = "Both" # Top, Bottom, Both, All
+        self.state.copperfill_clearance = 1
+        self.state.copperfill_edge_clearance = 1
+        self.state.copperfill_hatched_stroke_width = 1
+        self.state.copperfill_hatched_stroke_spacing = 1
+        self.state.copperfill_hatched_orientation = 45
+        self.state.copperfill_hex_diameter = 7
+        self.state.copperfill_hex_space = 0.5
+        self.state.copperfill_hex_threshold = 0.25
+
+
+    def cleanup(self):
+        self._background_stop.set()
+        try:
+            self._build_semaphore.release()
+        except ValueError:
+            pass
+        for thread_name in ("_pcb_file_watcher", "_build_worker"):
+            thread = getattr(self, thread_name, None)
+            if thread is not None and thread is not current_thread():
+                thread.join()
+        if os.path.exists(self.temp_dir):
+            shutil.rmtree(self.temp_dir)
+
+    def watch_pcb_files(self):
+        while not self._background_stop.wait(2):
+            changed = []
+            for pcb_file in list(self.pcb_files.values()):
+                mtime = pcb_file.get_mtime()
+                if mtime != pcb_file.mtime:
+                    pcb_file.mtime = mtime
+                    changed.append(pcb_file)
+
+            if not changed:
+                continue
+
+            self.request_build(reload_pcb_files=changed)
+
+    def request_build(self, export=False, generate_holes=False,
+                      reload_pcb_files=None, completion=None, run_build=True):
+        request = {
+            "export": export,
+            "generate_holes": generate_holes,
+            "reload_pcb_files": list(reload_pcb_files or []),
+            "completions": [completion] if completion is not None else [],
+            "run_build": run_build,
+        }
+        with self._build_request_lock:
+            is_preview = run_build and not export and not generate_holes and completion is None
+            if (is_preview and self._build_requests
+                    and self._build_requests[-1]["run_build"]
+                    and not self._build_requests[-1]["export"]
+                    and not self._build_requests[-1]["generate_holes"]
+                    and not self._build_requests[-1]["completions"]):
+                pending = self._build_requests[-1]
+                for pcb_file in request["reload_pcb_files"]:
+                    if pcb_file not in pending["reload_pcb_files"]:
+                        pending["reload_pcb_files"].append(pcb_file)
+            else:
+                self._build_requests.append(request)
+
+            try:
+                self._build_semaphore.release()
+            except ValueError:
+                # A build is already signaled; the request above was merged into it.
+                pass
+
+    def build_worker(self):
+        while True:
+            self._build_semaphore.acquire()
+            while not self._background_stop.is_set():
+                with self._build_request_lock:
+                    request = self._build_requests.pop(0) if self._build_requests else None
+
+                if request is None:
+                    break
+
+                error = None
+                for pcb_file in request["reload_pcb_files"]:
+                    try:
+                        pcb_file.load()
+                    except Exception as e:
+                        if error is None:
+                            error = e
+                        traceback.print_exc()
+                        pcb_file.error = f"{pcb_file.ident}: Failed to reload board: {e}"
+                if request["run_build"]:
+                    try:
+                        self._build(
+                            export=request["export"],
+                            generate_holes=request["generate_holes"],
+                        )
+                    except Exception as e:
+                        if error is None:
+                            error = e
+                        traceback.print_exc()
+                for completion in request["completions"]:
+                    completion["error"] = error
+                    completion["event"].set()
+
+            if self._background_stop.is_set():
+                return
+
+    def autoScale(self, canvas_width, canvas_height):
+        self.canvas_width, self.canvas_height = canvas_width, canvas_height
+
+        x1, y1 = 0, 0
+        x2, y2 = self.state.frame_width * self.unit, self.state.frame_height * self.unit
+        for pcb in self.state.pcb:
+            bbox = pcb.bbox
+            x1 = min(x1, bbox[0] - self.off_x)
+            y1 = min(y1, bbox[1] - self.off_y)
+            x2 = max(x2, bbox[2] - self.off_x)
+            y2 = max(y2, bbox[3] - self.off_y)
+
+        dw = x2-x1
+        dh = y2-y1
+
+        if dw == 0 or dh == 0:
+            return
+
+        sw = canvas_width / dw
+        sh = canvas_height / dh
+        scale = min(sw, sh) * 0.75
+        self.scale = scale
+        offx = (canvas_width - (dw+x1) * scale) / 2
+        offy = (canvas_height - (dh+y1) * scale) / 2
+        self.state.scale = (offx, offy, scale)
+
+    def addKiCad(self, e):
+        dir = None
+        if self.state.target_path:
+            dir = os.path.dirname(self.state.target_path)
+        elif self.state.pcb:
+            dir = os.path.dirname(self.state.pcb[0].file)
+        boardfile = OpenFile("Open KiCad PCB", dir=dir, types="KiCad PCB (*.kicad_pcb)|*.kicad_pcb")
+        if boardfile:
+            try:
+                self.addFile(boardfile)
+            except Exception:
+                traceback_text = traceback.format_exc()
+                traceback.print_exc()
+                Critical(
+                    f"Error loading PCB {boardfile}:\n\n{traceback_text}",
+                    "Error loading PCB",
+                )
+
+
+    def addFile(self, boardfile):
+        p = None
+        pcbs = []
+        try:
+            p = self.makePanelCell(boardfile)
+            if p.pcb_file.subboards > 1:
+                for i in range(p.pcb_file.subboards):
+                    sp = self.makePanelCell(boardfile, (p.pcb_file, i))
+                    pcbs.append(sp)
+                    self._addPCB(sp)
+            else:
+                pcbs.append(p)
+                self._addPCB(p)
+        except Exception as e:
+            for p in pcbs:
+                if p in self.state.pcb:
+                    self.state.pcb.remove(p)
+            raise e
+
+    def addGerberFolder(self, e):
+        folder = OpenDirectory("Open Gerber Folder")
+        if is_gerber_dir(folder):
+            self._addPCB(self.makePanelCell(folder))
+        else:
+            Critical("Invalid Gerber folder: {}".format(folder), "Invalid Gerber folder")
+
+    def addGerberZip(self, e):
+        zipfile = OpenFile("Open Gerber Zip", types="Gerber Zip (*.zip)|*.zip")
+        if is_gerber_zip(zipfile):
+            self._addPCB(self.makePanelCell(zipfile))
+        else:
+            Critical("Invalid Gerber zip: {}".format(zipfile), "Invalid Gerber zip")
+
+    def getPCBFile(self, path, subboard=None):
+        if os.path.isfile(path):
+            dirpath = os.path.dirname(path)
+            if is_gerber_dir(dirpath):
+                path = dirpath
+        path = os.path.realpath(path)
+        if subboard is None:
+            key = path
+        else:
+            key = (path, subboard[1])
+        if key not in self.pcb_files:
+            pcb_file = PCBFile(self, path, subboard=subboard, autoload=False)
+            completion = {"event": Event(), "error": None}
+            self.request_build(
+                reload_pcb_files=[pcb_file],
+                completion=completion,
+                run_build=False,
+            )
+            completion["event"].wait()
+            if completion["error"] is not None:
+                raise completion["error"]
+            self.pcb_files[key] = pcb_file
+        return self.pcb_files[key]
+
+    def makePanelCell(self, path, subboard=None):
+        return PanelCell(self, self.getPCBFile(path, subboard))
+
+    def _addPCB(self, pcb):
+        if len(self.state.pcb) > 0:
+            last = self.state.pcb[-1]
+            pcb.y = last.y + last.rheight + self.state.spacing * self.unit
+        else:
+            pcb.y = (self.state.frame_top + self.state.spacing if self.state.frame_top > 0 else 0) * self.unit
+        self.state.pcb.append(pcb)
+        self.state.scane = None
+        self.build()
+
+    def duplicate(self, e, pcb):
+        self._addPCB(pcb.clone())
+
+    def remove(self, e, obj):
+        if isinstance(obj, PanelCell):
+            self.state.pcb = [p for p in self.state.pcb if p is not obj]
+            self.state.scale = None
+        elif obj:
+            self.state.holes = [h for h in self.state.holes if h is not obj]
+        self.state.focus = None
+        self.build()
+
+    def select_tab(self, e, tab):
+        self.state.focus_tab = tab["o"]
+
+    def remove_tab(self, e, tab):
+        try:
+            self.state.focus._tabs.remove(tab["o"])
+        except ValueError:
+            pass
+        self.state.focus_tab = None
+        self.build()
+
+    def select_hole(self, e, hole):
+        self.state.focus = hole
+        self.state.focus_tab = None
+
+    def save(self, e, target=None):
+        if target is None:
+            target = SaveFile(self.state.target_path, types="Kikakuka FabPlan (*.kkkk_fab)|*.kkkk_fab")
+        if not target:
+            return
+
+        suffix = PNL_SUFFIX
+        if target.lower().endswith(LEGACY_PNL_SUFFIX):
+            target = target[:-len(LEGACY_PNL_SUFFIX)] + suffix
+        elif not target.lower().endswith(suffix):
+            target += suffix
+
+        target = os.path.realpath(target)
+
+        self.state.target_path = target
+
+        pcbs = []
+        for pcb in self.state.pcb:
+            subboard = None
+            if pcb.pcb_file.subboard:
+                subboard = pcb.pcb_file.subboard[1]
+            pcbs.append({
+                "file": relpath(pcb.file, os.path.dirname(target)),
+                "subboard": subboard,
+                "x": pcb.x,
+                "y": pcb.y,
+                "tolerance": pcb.tolerance,
+                "margin_left": pcb.margin_left,
+                "margin_right": pcb.margin_right,
+                "margin_top": pcb.margin_top,
+                "margin_bottom": pcb.margin_bottom,
+                "rotate": pcb.rotate,
+                "options": {k:v for k,v in pcb.build_options.items()},
+                "flags": [f for f in pcb.build_flags],
+                "tabs": [dict(tab) for tab in pcb._tabs],
+                "bom": relpath(pcb.bom_file, os.path.dirname(target)) if pcb.bom_file else "",
+                "cpl": relpath(pcb.cpl_file, os.path.dirname(target)) if pcb.cpl_file else "",
+            })
+        data = {
+            "export_path": self.state.export_path,
+            "hide_outside_reference_value": self.state.hide_outside_reference_value,
+            "frame_pcb": relpath(self.state.frame_pcb, os.path.dirname(target)) if self.state.frame_pcb else "",
+            "use_frame": self.state.use_frame,
+            "tight": self.state.tight,
+            "auto_tab": self.state.auto_tab,
+            "spacing": self.state.spacing,
+            "max_tab_spacing": self.state.max_tab_spacing,
+            "cut_method": self.state.cut_method,
+            "mb_diameter": self.state.mb_diameter,
+            "mb_spacing": self.state.mb_spacing,
+            "mb_offset": self.state.mb_offset,
+            "tab_width": self.state.tab_width,
+            "vc_layer": self.state.vc_layer,
+            "merge_vcuts": self.state.merge_vcuts,
+            "merge_vcuts_threshold": self.state.merge_vcuts_threshold,
+            "frame_width": self.state.frame_width,
+            "frame_height": self.state.frame_height,
+            "frame_top": self.state.frame_top,
+            "frame_bottom": self.state.frame_bottom,
+            "frame_left": self.state.frame_left,
+            "frame_right": self.state.frame_right,
+            "mill_fillets": self.state.mill_fillets,
+            "export_mill_fillets": self.state.export_mill_fillets,
+            "netRenamePattern": self.state.netRenamePattern,
+            "refRenamePattern": self.state.refRenamePattern,
+            "frame_tooling_holes": self.state.frame_tooling_holes,
+            "frame_tooling_horizontal_offset": self.state.frame_tooling_horizontal_offset,
+            "frame_tooling_vertical_offset": self.state.frame_tooling_vertical_offset,
+            "frame_tooling_diameter": self.state.frame_tooling_diameter,
+            "frame_tooling_solder_mask_opening_diameter": self.state.frame_tooling_solder_mask_opening_diameter,
+            "fiducials": self.state.fiducials,
+            "fiducials_layer": self.state.fiducials_layer,
+            "fiducials_clearance": self.state.fiducials_clearance,
+            "fiducials_diameter": self.state.fiducials_diameter,
+            "fiducials_solder_mask_opening_diameter": self.state.fiducials_solder_mask_opening_diameter,
+            "copperfill": self.state.copperfill,
+            "copperfill_layer": self.state.copperfill_layer,
+            "copperfill_clearance": self.state.copperfill_clearance,
+            "copperfill_edge_clearance": self.state.copperfill_edge_clearance,
+            "copperfill_hatched_stroke_width": self.state.copperfill_hatched_stroke_width,
+            "copperfill_hatched_stroke_spacing": self.state.copperfill_hatched_stroke_spacing,
+            "copperfill_hatched_orientation": self.state.copperfill_hatched_orientation,
+            "copperfill_hex_diameter": self.state.copperfill_hex_diameter,
+            "copperfill_hex_space": self.state.copperfill_hex_space,
+            "copperfill_hex_threshold": self.state.copperfill_hex_threshold,
+            "pcb": pcbs,
+            "hole": [list(transform(h.polygon.exterior, lambda p:p-(self.off_x, self.off_y)).coords) for h in self.state.holes],
+        }
+        with open(target, "w") as f:
+            json.dump(data, f, indent=4)
+
+
+    def load(self, e, target=None):
+        self.set_defaults()
+
+        if target is None:
+            target = OpenFile("Load FabPlan", types="Kikakuka FabPlan (*.kkkk_fab *.kikit_pnl)|*.kkkk_fab;*.kikit_pnl")
+        if target:
+            target = os.path.realpath(target)
+            self.state.target_path = target
+        else:
+            return
+
+        if not os.path.exists(target):
+            return
+
+        with open(target, "r") as f:
+            data = json.load(f)
+            if "export_path" in data:
+                self.state.export_path = data["export_path"]
+            if "hide_outside_reference_value" in data:
+                self.state.hide_outside_reference_value = data["hide_outside_reference_value"]
+            if "frame_pcb" in data:
+                self.state.frame_pcb = data["frame_pcb"]
+            if "frame_pcb" in data:
+                frame_pcb = data["frame_pcb"] or None
+                if frame_pcb and not os.path.isabs(frame_pcb):
+                    frame_pcb = os.path.realpath(os.path.join(os.path.dirname(target), frame_pcb))
+                self.state.frame_pcb = frame_pcb
+            if "use_frame" in data:
+                self.state.use_frame = data["use_frame"]
+            if "tight" in data:
+                self.state.tight = data["tight"]
+            if "auto_tab" in data:
+                self.state.auto_tab = data["auto_tab"]
+            if "spacing" in data:
+                self.state.spacing = data["spacing"]
+            if "max_tab_spacing" in data:
+                self.state.max_tab_spacing = data["max_tab_spacing"]
+            if "cut_method" in data:
+                self.state.cut_method = data["cut_method"]
+            if "mb_diameter" in data:
+                self.state.mb_diameter = data["mb_diameter"]
+            if "mb_spacing" in data:
+                self.state.mb_spacing = data["mb_spacing"]
+            if "mb_offset" in data:
+                self.state.mb_offset = data["mb_offset"]
+            if "tab_width" in data:
+                self.state.tab_width = data["tab_width"]
+            if "vc_layer" in data:
+                self.state.vc_layer = data["vc_layer"]
+            if "merge_vcuts" in data:
+                self.state.merge_vcuts = data["merge_vcuts"]
+            if "merge_vcuts_threshold" in data:
+                self.state.merge_vcuts_threshold = data["merge_vcuts_threshold"]
+            if "frame_width" in data:
+                self.state.frame_width = data["frame_width"]
+            if "frame_height" in data:
+                self.state.frame_height = data["frame_height"]
+            if "frame_top" in data:
+                self.state.frame_top = data["frame_top"]
+            if "frame_bottom" in data:
+                self.state.frame_bottom = data["frame_bottom"]
+            if "frame_left" in data:
+                self.state.frame_left = data["frame_left"]
+            if "frame_right" in data:
+                self.state.frame_right = data["frame_right"]
+            if "mill_fillets" in data:
+                self.state.mill_fillets = data["mill_fillets"]
+            if "export_mill_fillets" in data:
+                self.state.export_mill_fillets = data["export_mill_fillets"]
+            if "netRenamePattern" in data:
+                self.state.netRenamePattern = data["netRenamePattern"]
+            if "refRenamePattern" in data:
+                self.state.refRenamePattern = data["refRenamePattern"]
+
+            if "frame_tooling_holes" in data:
+                self.state.frame_tooling_holes = data["frame_tooling_holes"]
+            if "frame_tooling_horizontal_offset" in data:
+                self.state.frame_tooling_horizontal_offset = data["frame_tooling_horizontal_offset"]
+            if "frame_tooling_vertical_offset" in data:
+                self.state.frame_tooling_vertical_offset = data["frame_tooling_vertical_offset"]
+            if "frame_tooling_diameter" in data:
+                self.state.frame_tooling_diameter = data["frame_tooling_diameter"]
+            if "frame_tooling_solder_mask_opening_diameter" in data:
+                self.state.frame_tooling_solder_mask_opening_diameter = data["frame_tooling_solder_mask_opening_diameter"]
+            if "fiducials" in data:
+                self.state.fiducials = data["fiducials"]
+            if "fiducials_layer" in data:
+                self.state.fiducials_layer = data["fiducials_layer"]
+            if "fiducials_clearance" in data:
+                self.state.fiducials_clearance = data["fiducials_clearance"]
+            if "fiducials_diameter" in data:
+                self.state.fiducials_diameter = data["fiducials_diameter"]
+            if "fiducials_solder_mask_opening_diameter" in data:
+                self.state.fiducials_solder_mask_opening_diameter = data["fiducials_solder_mask_opening_diameter"]
+            if "copperfill" in data:
+                self.state.copperfill = data["copperfill"]
+            if "copperfill_layer" in data:
+                self.state.copperfill_layer = data["copperfill_layer"]
+            if "copperfill_clearance" in data:
+                self.state.copperfill_clearance = data["copperfill_clearance"]
+            if "copperfill_edge_clearance" in data:
+                self.state.copperfill_edge_clearance = data["copperfill_edge_clearance"]
+            if "copperfill_hatched_stroke_width" in data:
+                self.state.copperfill_hatched_stroke_width = data["copperfill_hatched_stroke_width"]
+            if "copperfill_hatched_stroke_spacing" in data:
+                self.state.copperfill_hatched_stroke_spacing = data["copperfill_hatched_stroke_spacing"]
+            if "copperfill_hatched_orientation" in data:
+                self.state.copperfill_hatched_orientation = data["copperfill_hatched_orientation"]
+            if "copperfill_hex_diameter" in data:
+                self.state.copperfill_hex_diameter = data["copperfill_hex_diameter"]
+            if "copperfill_hex_space" in data:
+                self.state.copperfill_hex_space = data["copperfill_hex_space"]
+            if "copperfill_hex_threshold" in data:
+                self.state.copperfill_hex_threshold = data["copperfill_hex_threshold"]
+
+            if "hole" in data:
+                holes = []
+                for h in data["hole"]:
+                    hole = Hole(self, h)
+                    holes.append(hole)
+                self.state.holes = holes
+
+            self.state.pcb = []
+            for p in data.get("pcb", []):
+                file = p["file"]
+                subboard = p.get("subboard", None)
+                if not os.path.isabs(file):
+                    file = os.path.realpath(os.path.join(os.path.dirname(target), file))
+                pcb = self.getPCBFile(file)
+                if subboard is None:
+                    pcb = self.makePanelCell(file)
+                else:
+                    pcb = self.makePanelCell(file, (pcb, subboard))
+                pcb.x = p["x"]
+                pcb.y = p["y"]
+                pcb.tolerance = p.get("tolerance", pcb.tolerance)
+                pcb.margin_left = p.get("margin_left", 0)
+                pcb.margin_right = p.get("margin_right", 0)
+                pcb.margin_top = p.get("margin_top", 0)
+                pcb.margin_bottom = p.get("margin_bottom", 0)
+                pcb.rotate = p["rotate"]
+                pcb.build_options = p.get("options", {})
+                pcb.build_flags = p.get("flags", [])
+                pcb.bom_file = p.get("bom", "")
+                if pcb.bom_file and not os.path.isabs(pcb.bom_file):
+                    pcb.bom_file = os.path.realpath(os.path.join(os.path.dirname(target), pcb.bom_file))
+                pcb.cpl_file = p.get("cpl", "")
+                if pcb.cpl_file and not os.path.isabs(pcb.cpl_file):
+                    pcb.cpl_file = os.path.realpath(os.path.join(os.path.dirname(target), pcb.cpl_file))
+                tabs = p.get("tabs", [])
+                for i in range(len(tabs)):
+                    if isinstance(tabs[i], list):
+                        tabs[i] = StateDict({
+                            "x": tabs[i][0],
+                            "y": tabs[i][1],
+                            "width": self.state.tab_width,
+                            "closest": True,
+                            "direction": 0.0 ,
+                        })
+                    else:
+                        tabs[i] = StateDict({
+                            "x": tabs[i]["x"],
+                            "y": tabs[i]["y"],
+                            "width": tabs[i].get("width", self.state.tab_width),
+                            "closest": tabs[i].get("closest", True),
+                            "direction": tabs[i].get("direction", 0.0),
+                        })
+                pcb._tabs = tabs
+                self.state.pcb.append(pcb)
+            self.state.scale = None
+            self.build()
+
+    def use_frame_pcb(self, e):
+        frame_pcb = OpenFile("Use Frame PCB", types="KiCad PCB (*.kicad_pcb)|*.kicad_pcb")
+        if frame_pcb:
+            self.state.frame_pcb = os.path.realpath(frame_pcb)
+            self.build()
+
+    def clear_frame_pcb(self, e):
+        self.state.frame_pcb = None
+        self.build()
+
+    def generate_holes(self, e):
+        self.build(generate_holes=True)
+
+    def copperfill_layers(self, panel):
+        if self.state.copperfill_layer == "Top":
+            return [Layer.F_Cu]
+        if self.state.copperfill_layer == "Bottom":
+            return [Layer.B_Cu]
+        if self.state.copperfill_layer == "All":
+            enabledLayers = panel.board.GetEnabledLayers()
+            return [layer for layer in Layer.allCu() if enabledLayers.Contains(layer)]
+        return [Layer.F_Cu, Layer.B_Cu]
+
+    def apply_copperfill(self, panel):
+        layers = self.copperfill_layers(panel)
+        kwargs = {
+            "clearance": round(float(self.state.copperfill_clearance) * self.unit),
+            "edgeclearance": round(float(self.state.copperfill_edge_clearance) * self.unit),
+            "layers": layers,
+        }
+
+        if self.state.copperfill == "Solid":
+            panel.apply(SolidCopperFill(**kwargs))
+        elif self.state.copperfill == "Hatched":
+            panel.apply(HatchedCopperFill(
+                **kwargs,
+                strokeWidth=round(float(self.state.copperfill_hatched_stroke_width) * self.unit),
+                strokeSpacing=round(float(self.state.copperfill_hatched_stroke_spacing) * self.unit),
+                orientation=fromDegrees(float(self.state.copperfill_hatched_orientation)),
+            ))
+        elif self.state.copperfill == "Hex":
+            panel.apply(HexCopperFill(
+                **kwargs,
+                diameter=round(float(self.state.copperfill_hex_diameter) * self.unit),
+                space=round(float(self.state.copperfill_hex_space) * self.unit),
+                threshold=float(self.state.copperfill_hex_threshold),
+            ))
+
+    def inclusion_tolerance(self, pcb):
+        try:
+            value = float(pcb.tolerance)
+            if value < 0:
+                return None
+            return panelize.fromMm(value)
+        except Exception:
+            return None
+
+    def build(self, e=None, export=False, generate_holes=False):
+        if export:
+            self.state.last_exported_path = ""
+
+        if export is True:
+            export = SaveFile(self.state.export_path, types="KiCad PCB (*.kicad_pcb)|*.kicad_pcb")
+            if not export:
+                return
+
+        if export:
+            if not export.endswith(PCB_SUFFIX):
+                export += PCB_SUFFIX
+            self.state.export_path = export
+
+        completion = None
+        if export:
+            completion = {"event": Event(), "error": None}
+
+        self.request_build(
+            export=export,
+            generate_holes=generate_holes,
+            completion=completion,
+        )
+
+        if completion is not None:
+            completion["event"].wait()
+            if completion["error"] is not None:
+                raise completion["error"]
+
+    def _build(self, export=False, generate_holes=False):
+        try:
+            self.state.netRenamePattern.format(n=0, orig="test")
+        except Exception as e:
+            Critical("Invalid net rename pattern: {}".format(e), "Invalid net rename pattern")
+            return
+
+        try:
+            self.state.refRenamePattern.format(n=0, orig="test")
+        except Exception as e:
+            Critical("Invalid ref rename pattern: {}".format(e), "Invalid ref rename pattern")
+            return
+
+        errors = []
+        warnings = []
+        conflicts = []
+
+        shapely_version = version_tuple(shapely.__version__)
+        if shapely_version and shapely_version < MIN_SHAPELY_VERSION:
+            warnings.append(f"Shapely {shapely.__version__} is older than {'.'.join(map(str, MIN_SHAPELY_VERSION))}")
+
+        for pcb in self.state.pcb:
+            if pcb.error:
+                errors.append(pcb.error)
+            elif self.inclusion_tolerance(pcb) is None:
+                errors.append(f"{pcb.ident}: Invalid inclusion tolerance {repr(pcb.tolerance)}")
+
+        pcbs = [
+            pcb for pcb in self.state.pcb
+            if not pcb.error and self.inclusion_tolerance(pcb) is not None
+        ]
+        if not pcbs:
+            with self.state:
+                self.state.errors = errors
+                self.state.conflicts = conflicts
+                self.state.warnings = warnings
+            return
+
+        board_thickness = pcbs[0].board_thickness
+        for pcb in pcbs[1:]:
+            if pcb.board_thickness != board_thickness:
+                warnings.append("Panelizing boards with different thicknesses")
+                break
+
+        copper_layer_count = pcbs[0].copper_layer_count
+        for pcb in pcbs[1:]:
+            if pcb.copper_layer_count != copper_layer_count:
+                errors.append("Attempting to panelize boards together of mixed layer counts")
+                break
+
+        constraint_profile = pcbs[0].constraint_profile
+        mismatched_constraints = [
+            pcb.ident for pcb in pcbs[1:]
+            if not same_constraint_profile(pcb.constraint_profile, constraint_profile)
+        ]
+        if mismatched_constraints:
+            warnings.append(
+                "Panel constraints are inherited from the first PCB; "
+                f"constraints differ for: {', '.join(mismatched_constraints)}"
+            )
+
+        if self.state.spacing < MIN_SPACING:
+            self.state.spacing = MIN_SPACING
+
+        spacing = self.state.spacing
+        tab_width = self.state.tab_width
+        max_tab_spacing = self.state.max_tab_spacing
+        mb_diameter = self.state.mb_diameter
+        mb_spacing = self.state.mb_spacing
+        mb_offset = self.state.mb_offset
+
+        dbg_points = []
+        dbg_rects = []
+        dbg_polygons = []
+        dbg_text = []
+
+        multiple_pcb = len(pcbs) > 1
+
+        if multiple_pcb or self.state.use_frame:
+            self.off_x = 20 * self.unit
+            self.off_y = 20 * self.unit
+        else:
+            self.off_x = pcbs[0].orig[0] - pcbs[0].x
+            self.off_y = pcbs[0].orig[1] - pcbs[0].y
+
+        frame_top_polygon = None
+        frame_bottom_polygon = None
+        frame_left_polygon = None
+        frame_right_polygon = None
+
+        if self.state.frame_pcb:
+            frame_panel = panelize.Panel(os.path.join(self.temp_dir, "temp.kicad_pcb"))
+            frame_panel.appendBoard(
+                self.state.frame_pcb,
+                pcbnew.VECTOR2I(round(self.off_x), round(self.off_y)),
+                origin=panelize.Origin.TopLeft,
+                tolerance=panelize.fromMm(1),
+                inheritDrc=False,
+            )
+
+            frameBody = Polygon(frame_panel.boardSubstrate.substrates)
+        else:
+            if self.state.use_frame and self.state.frame_top > 0:
+                frame_top_polygon = Polygon([
+                    [self.off_x, self.off_y],
+                    [self.off_x+self.state.frame_width*self.unit, self.off_y],
+                    [self.off_x+self.state.frame_width*self.unit, self.off_y+self.state.frame_top*self.unit],
+                    [self.off_x, self.off_y+self.state.frame_top*self.unit],
+                ])
+
+            if self.state.use_frame and self.state.frame_bottom > 0:
+                frame_bottom_polygon = Polygon([
+                    [self.off_x, self.off_y+self.state.frame_height*self.unit],
+                    [self.off_x+self.state.frame_width*self.unit, self.off_y+self.state.frame_height*self.unit],
+                    [self.off_x+self.state.frame_width*self.unit, self.off_y+self.state.frame_height*self.unit-self.state.frame_bottom*self.unit],
+                    [self.off_x, self.off_y+self.state.frame_height*self.unit-self.state.frame_bottom*self.unit],
+                ])
+
+            if self.state.use_frame and self.state.frame_left > 0:
+                frame_left_polygon = Polygon([
+                    [self.off_x, self.off_y],
+                    [self.off_x, self.off_y+self.state.frame_height*self.unit],
+                    [self.off_x+self.state.frame_left*self.unit, self.off_y+self.state.frame_height*self.unit],
+                    [self.off_x+self.state.frame_left*self.unit, self.off_y],
+                ])
+
+            if self.state.use_frame and self.state.frame_right > 0:
+                frame_right_polygon = Polygon([
+                    [self.off_x+self.state.frame_width*self.unit, self.off_y],
+                    [self.off_x+self.state.frame_width*self.unit, self.off_y+self.state.frame_height*self.unit],
+                    [self.off_x+self.state.frame_width*self.unit-self.state.frame_right*self.unit, self.off_y+self.state.frame_height*self.unit],
+                    [self.off_x+self.state.frame_width*self.unit-self.state.frame_right*self.unit, self.off_y],
+                ])
+
+            if pcbs:
+                x1, y1, x2, y2 = pcbs[0].bbox
+
+                x1 = min(x1, self.off_x)
+                y1 = min(y1, self.off_y)
+                x2 = max(x2, self.off_x + self.state.frame_width*self.unit)
+                y2 = max(y2, self.off_y + self.state.frame_height*self.unit)
+
+                for pcb in pcbs[1:]:
+                    bbox = pcb.bbox
+                    x1 = min(x1, bbox[0])
+                    y1 = min(y1, bbox[1])
+                    x2 = max(x2, bbox[2])
+                    y2 = max(y2, bbox[3])
+
+                frameBody = box(x1, y1, x2, y2)
+            else:
+                frameBody = None
+
+        cpl_unknown_layers = []
+
+        export_files = None
+        freekicad_layer = None
+        if export:
+            export_files = []
+            for pcb in pcbs:
+                file = pcb.kicad_file
+                if not os.path.exists(file):
+                    convert_errors = convert_to_kicad(
+                        pcb.file,
+                        pcb.kicad_file,
+                        outline_only=False,
+                        bom_file=(pcb.bom_file if os.path.exists(pcb.bom_file)
+                                  else None),
+                        cpl_file=(pcb.cpl_file if os.path.exists(pcb.cpl_file)
+                                  else None))
+                    pcb.permanent_errors.extend(convert_errors)
+                export_files.append(file)
+            try:
+                export_files, freekicad_layer, moved_counts = \
+                    prepare_panel_freekicad_sources(
+                        export_files, self.temp_dir, pcbnew,
+                        FREEKICAD_LAYER_NAME,
+                        reserved_layers=(
+                            [Layer.User_1]
+                            if self.state.vc_layer == "User.1" else []))
+            except (OSError, ValueError, RuntimeError) as ex:
+                errors.append(f"Could not normalize FreekiCAD layers: {ex}")
+                with self.state:
+                    self.state.errors = errors
+                    self.state.conflicts = conflicts
+                    self.state.warnings = warnings
+                return
+            if freekicad_layer is not None:
+                print(
+                    "Panelizer: FreekiCAD canonical layer "
+                    f"{pcbnew.BOARD.GetStandardLayerName(freekicad_layer)}; "
+                    f"drawings={moved_counts}")
+
+        panel = panelize.Panel(self.state.export_path if export else os.path.join(self.temp_dir, "temp.kicad_pcb"))
+        if freekicad_layer is not None:
+            panel.board.SetLayerName(
+                freekicad_layer, FREEKICAD_LAYER_NAME)
+            enabled_layers = panel.board.GetEnabledLayers()
+            enabled_layers.addLayer(freekicad_layer)
+            panel.board.SetEnabledLayers(enabled_layers)
+        panel.vCutSettings.layer = {
+            "Cmts.User": Layer.Cmts_User,
+            "Edge.Cuts": Layer.Edge_Cuts,
+            "User.1": Layer.User_1,
+        }.get(self.state.vc_layer, Layer.Cmts_User)
+
+        if frame_top_polygon:
+            panel.appendSubstrate(frame_top_polygon)
+        if frame_bottom_polygon:
+            panel.appendSubstrate(frame_bottom_polygon)
+        if frame_left_polygon:
+            panel.appendSubstrate(frame_left_polygon)
+        if frame_right_polygon:
+            panel.appendSubstrate(frame_right_polygon)
+
+        for i, pcb in enumerate(pcbs):
+            self.refMap = {}
+            file = pcb.outline_file
+            if export:
+                file = export_files[i]
+
+            if export:
+                panel.appendBoard(
+                    file,
+                    pcbnew.VECTOR2I(round(self.off_x + pcb.x), round(self.off_y + pcb.y)),
+                    origin=panelize.Origin.TopLeft,
+                    tolerance=self.inclusion_tolerance(pcb),
+                    rotationAngle=pcbnew.EDA_ANGLE(pcb.rotate, pcbnew.DEGREES_T),
+                    inheritDrc=False,
+                    netRenamer=self.netRenamer if multiple_pcb else None,
+                    refRenamer=self.refRenamer if multiple_pcb else None
+                )
+            else:
+                pcb_substrate = Substrate([])
+                pcb_substrate.union(shapely.union_all(pcb.shapes))
+                panel.boardSubstrate.union(pcb_substrate)
+                panel.substrates.append(pcb_substrate)
+
+            if export:
+                fp_count = 0
+                for fp in panel.board.GetFootprints():
+                    ref = fp.Reference()
+                    t = ref.GetText()
+
+                    # Build Variants
+                    if (t in self.refMap or not multiple_pcb):
+                        fp_count += 1
+                        if fp.HasField(BUILDEXPR):
+                            expr = fp.GetFieldText(BUILDEXPR)
+                            if expr:
+                                place = buildexpr(expr, pcb.build_flags)
+                                # print("BUILDEXPR", i, expr, pcb.build_flags, place)
+
+                                if place:
+                                    fp.SetExcludedFromPosFiles(False)
+                                    fp.SetExcludedFromBOM(False)
+                                    fp.SetDNP(False)
+                                else:
+                                    # print("SET DNP", i, fp.GetReference(), expr, pcb.build_flags, place)
+                                    fp.SetDNP(True)
+
+                        for field_spec, field_value in fp.GetFieldsText().items():
+                            if "#" in field_spec and field_value:
+                                tks = field_spec.split("#")
+                                field = tks[0]
+                                matched = True
+                                for condition in [t.strip() for t in tks[1:]]:
+                                    if "=" in condition:
+                                        option, expected = condition.split("=", 1)
+                                        if pcb.build_options.get(option) != expected:
+                                            matched = False
+                                            break
+                                    else:
+                                        if condition not in pcb.build_flags:
+                                            matched = False
+                                            break
+                                if matched:
+                                    field_exists = fp.HasField(field)
+                                    fp.SetField(field, field_value)
+                                    if not field_exists:
+                                        text = get_footprint_field(fp, field)
+                                        if text:
+                                            text.SetVisible(False)
+
+                        if fp.GetFPIDAsString().rsplit(":", 1)[-1] == "StringTemplate":
+                            properties = fp.GetFieldsText()
+                            template_args = {**properties, **pcb.build_options}
+                            fp.SetValue(properties["Value"].format(**template_args))
+
+                    # Cannot loop inside panel, do incremental update to map footprint to the pccb
+                    # Preserve silkscreen text regardless of reference renaming
+                    # https://github.com/yaqwsx/KiKit/pull/845
+                    if multiple_pcb and ref.IsVisible() and t != self.refMap.get(t, t):
+                        text = pcbnew.PCB_TEXT(panel.board)
+                        text.SetText(self.refMap.get(t, t))
+                        text.SetTextX(ref.GetTextPos()[0])
+                        text.SetTextY(ref.GetTextPos()[1])
+                        text.SetTextThickness(ref.GetTextThickness())
+                        text.SetTextSize(ref.GetTextSize())
+                        text.SetHorizJustify(ref.GetHorizJustify())
+                        text.SetVertJustify(ref.GetVertJustify())
+                        text.SetTextAngle(ref.GetTextAngle())
+                        text.SetLayer(ref.GetLayer())
+                        text.SetMirrored(ref.IsMirrored())
+                        panel.board.Add(text)
+                        ref.SetVisible(False)
+
+                pcb.fp_count = fp_count
+
+        if self.state.hide_outside_reference_value and export:
+            for fp in panel.board.GetFootprints():
+                ref = fp.Reference()
+                for pcb in pcbs:
+                    if pcb.contains(Point(ref.GetX(), ref.GetY())):
+                        break
+                else:
+                    ref.SetVisible(False)
+
+                value = fp.Value()
+                for pcb in pcbs:
+                    if pcb.contains(Point(value.GetX(), value.GetY())):
+                        break
+                else:
+                    value.SetVisible(False)
+
+        if frameBody and (self.state.frame_pcb or self.state.use_frame) and self.state.tight:
+            print("Making board holes")
+            for s in panel.substrates:
+                frameBody = frameBody.difference(s.exterior().buffer(spacing*self.unit, join_style="mitre"))
+
+            print("Making holes")
+            for hole in self.state.holes:
+                poly = hole.polygon
+                frameBody = frameBody.difference(poly)
+
+            print("Removing islands")
+            if isinstance(frameBody, MultiPolygon):
+                geoms = [(g.area, g) for g in frameBody.geoms]
+                geoms.sort(key=lambda x: x[0], reverse=True)
+                frameBody = geoms[0][1]
+            panel.appendSubstrate(frameBody)
+
+        cuts = []
+
+        tab_substrates = []
+
+        # manual tab
+        for pcb in pcbs:
+            for i, tab in enumerate(pcb.tabs()):
+                x1 = tab["x1"]
+                y1 = tab["y1"]
+                x2 = tab["x2"]
+                y2 = tab["y2"]
+                width = tab["width"]
+                tx, ty = extrapolate(x1, y1, x2, y2, 1, SHP_EPSILON * 2)
+
+                sideOrigin = makeSpanningPoints(panel.boardSubstrate, shapely.union_all(pcb.shapes), (tx, ty), (x2-x1, y2-y1), width*self.unit)
+                if sideOrigin is None:
+                    continue
+
+                sideOriginA, sideOriginB = sideOrigin
+
+                # outward
+                tab = autotab(panel.boardSubstrate, sideOriginA, sideOriginB, (x2-x1, y2-y1))
+                if tab: # (tab, tabface)
+                    tab_substrates.append(tab[0])
+                    for p in pcbs:
+                        dist = p.distance(tab[1])
+                        if dist <= SHP_EPSILON:
+                            cuts.append(tab[1])
+                            break
+
+                    # inward
+                    tab = autotab(panel.boardSubstrate, sideOriginB, sideOriginA, (x1-x2, y1-y2))
+                    if tab: # (tab, tabface)
+                        tab_substrates.append(tab[0])
+                        cuts.append(tab[1])
+
+        # auto tab
+
+        # (x, y), inward_direction, score_divider
+        tab_candidates = []
+
+        x_parts = []
+        y_parts = []
+        for pcb in pcbs:
+            x1, y1, x2, y2 = pcb.bbox
+            x_parts.append(x1)
+            y_parts.append(y1)
+
+        if self.state.auto_tab and max_tab_spacing > 0:
+            for pcb in pcbs:
+                if pcb.tabs():
+                    continue
+                bboxes = [p.bbox for p in pcbs if p is not pcb]
+                if self.state.use_frame:
+                    if self.state.tight:
+                        bboxes.append((0, 0, self.state.frame_width*self.unit, self.state.frame_height*self.unit))
+                    else:
+                        if self.state.frame_top > 0:
+                            bboxes.append((0, 0, self.state.frame_width*self.unit, self.state.frame_top*self.unit))
+                        if self.state.frame_bottom > 0:
+                            bboxes.append((0, self.state.frame_height*self.unit-self.state.frame_bottom*self.unit, self.state.frame_width*self.unit, self.state.frame_height*self.unit))
+                        if self.state.frame_left > 0:
+                            bboxes.append((0, 0, self.state.frame_left*self.unit, self.state.frame_height*self.unit))
+                        if self.state.frame_right > 0:
+                            bboxes.append((self.state.frame_width*self.unit-self.state.frame_right*self.unit, 0, self.state.frame_width*self.unit, self.state.frame_height*self.unit))
+
+                x1, y1, x2, y2 = pcb.bbox
+                row_bboxes = [(b[0],b[2]) for b in bboxes if LineString([(0, b[1]), (0, b[3])]).intersects(LineString([(0, y1), (0, y2)]))]
+                col_bboxes = [(b[1],b[3]) for b in bboxes if LineString([(b[0], 0), (b[2], 0)]).intersects(LineString([(x1, 0), (x2, 0)]))]
+
+                # top
+                if col_bboxes and y1 != min([b[0] for b in col_bboxes]):
+                    n = math.ceil((x2-x1) / (max_tab_spacing*self.unit))+1
+                    for i in range(1,n):
+                        p = (x1 + (x2-x1)*i/n, y1 - spacing/2*self.unit)
+                        partition = len([x for x in x_parts if x < p[0]])
+                        tab_candidates.append((pcb, p, (0,1), partition, (x2-x1)/n))
+
+                # bottom
+                if col_bboxes and y2 != max([b[1] for b in col_bboxes]):
+                    n = math.ceil((x2-x1) / (max_tab_spacing*self.unit))+1
+                    for i in range(1,n):
+                        p = (x1 + (x2-x1)*i/n, y2 + spacing/2*self.unit)
+                        partition = len([x for x in x_parts if x < p[0]])
+                        tab_candidates.append((pcb, p, (0,-1), partition, (x2-x1)/n))
+
+                # left
+                if row_bboxes and x1 != min([b[0] for b in row_bboxes]):
+                    n = math.ceil((y2-y1) / (max_tab_spacing*self.unit))+1
+                    for i in range(1,n):
+                        p = (x1 - spacing/2*self.unit , y1 + (y2-y1)*i/n)
+                        partition = len([y for y in y_parts if y < p[1]])
+                        tab_candidates.append((pcb, p, (1,0), partition, (y2-y1)/n))
+
+                # right
+                if row_bboxes and x2 != max([b[1] for b in row_bboxes]):
+                    n = math.ceil((y2-y1) / (max_tab_spacing*self.unit))+1
+                    for i in range(1,n):
+                        p = (x2 + spacing/2*self.unit , y1 + (y2-y1)*i/n)
+                        partition = len([y for y in y_parts if y < p[1]])
+                        tab_candidates.append((pcb, p, (-1,0), partition, (y2-y1)/n))
+
+        tab_candidates.sort(key=lambda t: t[-1]) # sort by divided edge length
+
+        filtered_cands = []
+        for pcb, p, inward_direction, partition, score_divider in tab_candidates:
+            skip = False
+            for hole in self.state.holes:
+                shape = hole.polygon
+                if shape.contains(Point(*p)):
+                    skip = True
+                    break
+            if skip:
+                continue
+            filtered_cands.append((pcb, p, inward_direction, partition, score_divider))
+            dbg_points.append((p, 1))
+        tab_candidates = filtered_cands
+
+        # x, y, abs(direction), partition index
+        tabs = []
+        tab_dist = max_tab_spacing * self.unit / 3
+        for pcb, p, inward_direction, partiion, score_divider in tab_candidates:
+            # prevent overlapping tabs
+            if spacing <= mb_diameter and len([t for t in tabs if
+                    (abs(inward_direction[0]), abs(inward_direction[1]))==(abs(t[2][0]), abs(t[2][1])) # same axis
+                    and
+                    t[3] == partiion # same partition
+                    and
+                    ( # nearby
+                        ( # horizontal
+                            abs(inward_direction[1]) == 1
+                            and
+                            abs(t[1] - p[1]) < spacing * self.unit
+                            and
+                            abs(t[0]-p[0]) < tab_dist
+                        )
+                        or
+                        ( # vertical
+                            abs(inward_direction[0]) == 1
+                            and
+                            abs(t[0] - p[0]) < spacing * self.unit
+                            and
+                            abs(t[1]-p[1]) < tab_dist
+                        )
+                    )
+
+                ]) > 0:
+                continue
+            dbg_points.append((p, 5))
+
+            outward_direction = (inward_direction[0]*-1,inward_direction[1]*-1)
+            sideOrigin = makeSpanningPoints(panel.boardSubstrate, shapely.union_all(pcb.shapes), p, outward_direction, tab_width*self.unit)
+            if sideOrigin is None:
+                continue
+            sideOriginA, sideOriginB = sideOrigin
+
+            # outward
+            tab = autotab(panel.boardSubstrate, sideOriginA, sideOriginB, outward_direction)
+            if tab: # (tab, tabface)
+                tab_substrates.append(tab[0])
+                for p in pcbs:
+                    dist = p.distance(tab[1])
+                    if dist <= SHP_EPSILON:
+                        cuts.append(tab[1])
+                        break
+
+                # inward
+                tab = autotab(panel.boardSubstrate, sideOriginB, sideOriginA, inward_direction)
+                if tab: # (tab, tabface)
+                    tab_substrates.append(tab[0])
+                    cuts.append(tab[1])
+
+        # https://github.com/buganini/Kikakuka/issues/22
+        if spacing == 0:
+            if self.state.use_frame and self.state.tight:
+                for pcb in pcbs:
+                    for polygon in pcb.shapes:
+                        n = len(polygon.exterior.coords)
+                        for i in range(n):
+                            p1 = polygon.exterior.coords[i]
+                            p2 = polygon.exterior.coords[(i+1)%n]
+                            if p1 == p2:
+                                continue
+
+                            adjacent = True
+                            ls = LineString([p1, p2])
+                            for hole in self.state.holes:
+                                if hole.polygon.exterior.contains(ls):
+                                    adjacent = False
+                                    break
+
+                            if adjacent:
+                                cuts.append(LineString([p1, p2]))
+            else:
+                edges = []
+
+                for pcb in pcbs:
+                    for polygon in pcb.shapes:
+                        n = len(polygon.exterior.coords)
+                        for i in range(n):
+                            p1 = polygon.exterior.coords[i]
+                            p2 = polygon.exterior.coords[(i+1)%n]
+                            if p1 == p2:
+                                continue
+
+                            adjacent = False
+                            ls = LineString([p1, p2])
+                            if frame_top_polygon:
+                                intersection = ls.intersection(frame_top_polygon)
+                                if not intersection.is_empty and isinstance(intersection, LineString):
+                                    adjacent = True
+                            if frame_bottom_polygon:
+                                intersection = ls.intersection(frame_bottom_polygon)
+                                if not intersection.is_empty and isinstance(intersection, LineString):
+                                    adjacent = True
+                            if frame_left_polygon:
+                                intersection = ls.intersection(frame_left_polygon)
+                                if not intersection.is_empty and isinstance(intersection, LineString):
+                                    adjacent = True
+                            if frame_right_polygon:
+                                intersection = ls.intersection(frame_right_polygon)
+                                if not intersection.is_empty and isinstance(intersection, LineString):
+                                    adjacent = True
+                            if not adjacent:
+                                for edge in edges:
+                                    intersection = edge.intersection(ls)
+                                    if not intersection.is_empty and isinstance(intersection, LineString):
+                                        adjacent = True
+                                        break
+                            edges.append(ls)
+
+                            if adjacent:
+                                cuts.append(ls)
+
+        for t in tab_substrates:
+            dbg_polygons.append(t.exterior.coords)
+            try:
+                panel.appendSubstrate(t)
+            except Exception as e:
+                warnings.append(f"{panelizer_warning_prefix(e)}Failed to append tab substrate: {e}")
+                traceback.print_exc()
+
+        # frame boundary
+        shapes = [shapely.union_all(p.shapes) for p in pcbs]
+        if self.state.use_frame:
+            frame = Polygon([
+                (self.off_x, self.off_y),
+                (self.off_x+self.state.frame_width*self.unit, self.off_y),
+                (self.off_x+self.state.frame_width*self.unit, self.off_y+self.state.frame_height*self.unit),
+                (self.off_x, self.off_y+self.state.frame_height*self.unit),
+            ])
+            try:
+                out_of_frame = GeometryCollection(shapes).difference(frame)
+                if not out_of_frame.is_empty:
+                    conflicts.append(out_of_frame)
+                    errors.append("PCB placement exceeds frame boundaries")
+            except Exception as e:
+                warnings.append(f"{panelizer_warning_prefix(e)}Failed to check frame boundaries: {e}")
+                traceback.print_exc()
+        frames = []
+        if frame_top_polygon:
+            frames.append(frame_top_polygon)
+        if frame_bottom_polygon:
+            frames.append(frame_bottom_polygon)
+        if frame_left_polygon:
+            frames.append(frame_left_polygon)
+        if frame_right_polygon:
+            frames.append(frame_right_polygon)
+        if frames:
+            shapes.append(shapely.union_all(frames))
+
+        # frame edge
+        overlapped = False
+        for i,a in enumerate(shapes):
+            for b in shapes[i+1:]:
+                conflict = shapely.intersection(a, b)
+                if not conflict.is_empty and conflict.area > 0:
+                    conflicts.append(conflict)
+                    overlapped = True
+        if overlapped:
+            errors.append("PCB overlaps with other PCB or frame edges")
+
+        if self.state.debug_bbox:
+            for pcb in pcbs:
+                shapes = pcb.shapes
+                for s in shapes:
+                    dbg_rects.append(s.bounds)
+
+        if generate_holes:
+            substrates = [frame_top_polygon, frame_bottom_polygon, frame_left_polygon, frame_right_polygon]
+            for pcb in self.state.pcb:
+                for polygon in pcb.shapes:
+                    substrates.append(polygon)
+            subsrates = [s for s in substrates if s is not None]
+            loose_substrates = shapely.union_all(substrates)
+            board_substrates = shapely.union_all(panel.boardSubstrate.substrates)
+            diffs = board_substrates.difference(loose_substrates)
+            if isinstance(diffs, MultiPolygon):
+                diffs = diffs.geoms
+            else:
+                diffs = [diffs]
+            for diff in diffs:
+                self.state.holes.append(Hole(self, diff.exterior.coords))
+
+            self._build()
+            return
+
+        if not export or self.state.export_mill_fillets:
+            panel.addMillFillets(self.state.mill_fillets*self.unit)
+
+        cuts = sorted(cuts,key=lambda cut: cut.bounds)
+
+        vcuts = []
+        bites = []
+        warned_non_straight_mouse_bite = False
+
+        def add_mouse_bite(cut):
+            nonlocal warned_non_straight_mouse_bite
+            if not warned_non_straight_mouse_bite and not is_straight_line(cut):
+                warnings.append("Mouse bites are created on a non-straight edge")
+                warned_non_straight_mouse_bite = True
+            bites.append(cut)
+
+        cut_method = self.state.cut_method
+        merge_vcuts = self.state.merge_vcuts
+        merge_vcuts_threshold = self.state.merge_vcuts_threshold * self.unit
+
+        vcuts_tolerance = SHP_EPSILON * 5
+
+        if cut_method == "mb":
+            for cut in cuts:
+                add_mouse_bite(cut)
+        elif cut_method == "vc_unsafe":
+            vcuts.extend(cuts)
+        elif cut_method in ("vc_or_mb", "vc_and_mb", "vc_or_skip"):
+            for cut in cuts:
+                p1 = cut.coords[0]
+                p2 = cut.coords[-1]
+                if abs(p1[0] - p2[0]) <= vcuts_tolerance: # vertical
+                    px = (p1[0]+p2[0])/2
+                    vc_ok = True
+                    for i, pcb in enumerate(pcbs):
+                        x1, y1, x2, y2 = pcb.bbox
+                        if x1+vcuts_tolerance < px and px < x2-vcuts_tolerance: # cut through other pcb
+                            vc_ok = False
+                            break
+
+                    do_vc = vc_ok
+                    do_mb = (not vc_ok or cut_method == "vc_and_mb") and cut_method != "vc_or_skip"
+
+                    if do_mb:
+                        add_mouse_bite(cut)
+                    if do_vc:
+                        cut = LineString([(px, p1[1]), (px, p2[1])])
+                        vcuts.append(cut)
+                elif abs(p1[1] - p2[1]) <= merge_vcuts_threshold * 0.2: # horizontal
+                    py = (p1[1]+p2[1])/2
+                    vc_ok = True
+                    for i, pcb in enumerate(pcbs):
+                        x1, y1, x2, y2 = pcb.bbox
+                        if y1+vcuts_tolerance < py and py < y2-vcuts_tolerance: # cut through other pcb
+                            vc_ok = False
+                            break
+
+                    do_vc = vc_ok
+                    do_mb = (not vc_ok or cut_method == "vc_and_mb") and cut_method != "vc_or_skip"
+
+                    if do_mb:
+                        add_mouse_bite(cut)
+                    if do_vc:
+                        cut = LineString([(p1[0], py), (p2[0], py)])
+                        vcuts.append(cut)
+                else:
+                    if cut_method != "vc_or_skip":
+                        add_mouse_bite(cut)
+
+        if export and bites:
+            panel.makeMouseBites(bites, diameter=mb_diameter * self.unit, spacing=mb_spacing * self.unit - SHP_EPSILON, offset=mb_offset * self.unit, prolongation=0 * self.unit)
+
+        # normalize linestring direction
+        for i in range(len(vcuts)):
+            if vcuts[i].coords[0][1] > vcuts[i].coords[1][1]:
+                vcuts[i] = shapely.reverse(vcuts[i])
+            if vcuts[i].coords[0][0] > vcuts[i].coords[1][0]:
+                vcuts[i] = shapely.reverse(vcuts[i])
+
+        if merge_vcuts:
+            if self.state.debug:
+                conflicts.extend(vcuts)
+
+            horizontal_vcuts = []
+            vertical_vcuts = []
+            for vcut in vcuts:
+                if vcut.coords[0][1] == vcut.coords[-1][1]:
+                    horizontal_vcuts.append(vcut.coords[0][1])
+                if vcut.coords[0][0] == vcut.coords[-1][0]:
+                    vertical_vcuts.append(vcut.coords[0][0])
+
+            # grouping
+            horitonzal_groups = []
+            for p in horizontal_vcuts:
+                for g in horitonzal_groups:
+                    if any([abs(p-p2) <= merge_vcuts_threshold + SHP_EPSILON for p2 in g]):
+                        if not p in g:
+                            g.append(p)
+                        break
+                else:
+                    horitonzal_groups.append([p])
+
+            vertical_groups = []
+            for p in vertical_vcuts:
+                for g in vertical_groups:
+                    if any([abs(p-p2) <= merge_vcuts_threshold + SHP_EPSILON for p2 in g]):
+                        if not p in g:
+                            g.append(p)
+                        break
+                else:
+                    vertical_groups.append([p])
+
+            horitonzal_groups = [sum(g)/len(g) for g in horitonzal_groups]
+            vertical_groups = [sum(g)/len(g) for g in vertical_groups]
+
+            vcuts = []
+
+            boardSubstrateBounds = panel.boardSubstrate.bounds()
+            for y in horitonzal_groups:
+                vcuts.append(LineString([(boardSubstrateBounds[0], y), (boardSubstrateBounds[2], y)]))
+            for x in vertical_groups:
+                vcuts.append(LineString([(x, boardSubstrateBounds[1]), (x, boardSubstrateBounds[3])]))
+
+        if export and vcuts:
+            panel.makeVCuts(vcuts)
+
+        if export and not self.state.frame_pcb and self.state.use_frame and self.state.frame_tooling_holes:
+            horizontalOffset = self.state.frame_tooling_horizontal_offset * self.unit
+            verticalOffset = self.state.frame_tooling_vertical_offset * self.unit
+            holeCount = 4
+            diameter = self.state.frame_tooling_holes * self.unit
+            solderMaskDiameter = self.state.frame_tooling_solder_mask_opening_diameter * self.unit
+            for i, pos in enumerate(panel.panelCorners(horizontalOffset, verticalOffset)[:holeCount]):
+                footprint = pcbnew.FootprintLoad(kikit.common.KIKIT_LIB, "NPTH")
+                footprint.SetPosition(pos)
+                for pad in footprint.Pads():
+                    pad.SetDrillSize(toKiCADPoint((diameter, diameter)))
+                    pad.SetSize(toKiCADPoint((solderMaskDiameter, solderMaskDiameter)))
+                panel.board.Add(footprint)
+
+        if export and not self.state.frame_pcb and self.state.use_frame and self.state.fiducials:
+            diameter = self.state.fiducials_diameter * self.unit
+            solderMaskDiameter = self.state.fiducials_solder_mask_opening_diameter * self.unit
+            if self.state.frame_top and self.state.frame_bottom:
+                horizontalOffset = (self.state.frame_tooling_horizontal_offset + self.state.frame_tooling_solder_mask_opening_diameter * 4) * self.unit
+                verticalOffset = (self.state.fiducials_clearance + self.state.fiducials_diameter/2) * self.unit
+
+                for i, pos in enumerate(panel.panelCorners(horizontalOffset, verticalOffset)[:4]):
+                    if self.state.fiducials_layer == "Top" or self.state.fiducials_layer == "Both":
+                        panel.addFiducial(pos, diameter, solderMaskDiameter, bottom=False)
+                    if self.state.fiducials_layer == "Bottom" or self.state.fiducials_layer == "Both":
+                        panel.addFiducial(pos, diameter, solderMaskDiameter, bottom=True)
+
+            if self.state.frame_left and self.state.frame_right:
+                horizontalOffset = (self.state.fiducials_clearance + self.state.fiducials_diameter/2) * self.unit
+                verticalOffset = (self.state.frame_tooling_vertical_offset + self.state.frame_tooling_solder_mask_opening_diameter * 4) * self.unit
+
+                for i, pos in enumerate(panel.panelCorners(horizontalOffset, verticalOffset)[:4]):
+                    if self.state.fiducials_layer == "Top" or self.state.fiducials_layer == "Both":
+                        panel.addFiducial(pos, diameter, solderMaskDiameter, bottom=False)
+                    if self.state.fiducials_layer == "Bottom" or self.state.fiducials_layer == "Both":
+                        panel.addFiducial(pos, diameter, solderMaskDiameter, bottom=True)
+
+        if not export:
+            with self.state:
+                self.state.errors = errors
+                self.state.conflicts = conflicts
+                self.state.dbg_points = dbg_points
+                self.state.dbg_rects = dbg_rects
+                self.state.dbg_polygons = dbg_polygons
+                self.state.dbg_text = dbg_text
+                self.state.warnings = warnings
+                self.state.boardSubstrate = panel.boardSubstrate.substrates
+                self.state.vcuts = vcuts
+                self.state.bites = bites
+
+        if export and self.state.copperfill != "None":
+            self.apply_copperfill(panel)
+
+        if export:
+            panel.save()
+            copy_constraint_profile(pcbs[0].kicad_file, panel.filename)
+            self.state.last_exported_path = panel.filename
+
+        self.state.redraw += 1
+        gc.collect()
+
+    def addHole(self, e):
+        self.tool = Tool.HOLE
+        self.state.edit_polygon = []
+
+    def align_top(self, e, pcb=None):
+        todo = list(self.state.pcb)
+        if not todo:
+            return
+        todo.sort(key=lambda pcb: pcb.bbox[1])
+
+        topmost = (self.state.frame_top + (self.state.spacing if self.state.frame_top > 0 else 0)) * self.unit + self.off_y
+        if pcb:
+            ys = [topmost]
+            for p in todo:
+                x1, y1, x2, y2 = p.bbox
+                ys.append(y1)
+                ys.append(y2 + self.state.spacing * self.unit)
+                ys.append(y2 - pcb.rheight)
+            ys.sort()
+
+        start = 0
+        end = len(todo)
+        if pcb:
+            start = todo.index(pcb)
+            end = start+1
+        for i, p in enumerate(todo[start:end], start):
+            ax1, ay1, ax2, ay2 = p.bbox
+            top = None
+            margin = 0
+            for d in todo[:i]:
+                dist = p.directional_distance(d, (0, -1))
+                if dist is not None:
+                    t = ay1 - dist
+                    if top is None or t > top:
+                        top = t
+                        margin = d.margin_bottom
+
+            margin = max(margin, p.margin_top) * self.unit
+            if pcb:
+                if top is None:
+                    p.setTop(([y for y in ys if y < ay1] or [ys[0]])[-1] + margin)
+                else:
+                    p.setTop(([y for y in ys if y < ay1 and y>=top] or [top])[-1] + margin)
+            else:
+                if top is None:
+                    # move objects behind together to prevent overlapping
+                    offset = topmost - ay1
+                    for o in todo[i+1:]:
+                        if o.directional_distance(p, (0, -1)):
+                            o.setTop(o.bbox[1]+offset + margin)
+                    p.setTop(topmost + margin)
+                else:
+                    p.setTop(max(
+                        top + self.state.spacing*self.unit,
+                        topmost
+                    ) + margin)
+        self.state.scale = None
+        self.build()
+
+    def align_bottom(self, e, pcb=None):
+        todo = list(self.state.pcb)
+        if not todo:
+            return
+        todo.sort(key=lambda pcb: -pcb.bbox[3])
+
+        bottommost = (self.state.frame_height - self.state.frame_bottom - (self.state.spacing if self.state.frame_bottom > 0 else 0)) * self.unit + self.off_y
+        if pcb:
+            ys = [bottommost]
+            for p in todo:
+                x1, y1, x2, y2 = p.bbox
+                ys.append(y1 - self.state.spacing * self.unit)
+                ys.append(y2)
+                ys.append(y1 + pcb.rheight)
+            ys.sort()
+
+        start = 0
+        end = len(todo)
+        if pcb:
+            start = todo.index(pcb)
+            end = start+1
+        for i, p in enumerate(todo[start:end], start):
+            ax1, ay1, ax2, ay2 = p.bbox
+            bottom = None
+            margin = 0
+            for d in todo[:i]:
+                dist = p.directional_distance(d, (0, 1))
+                if dist is not None:
+                    b = ay2 + dist
+                    if bottom is None or b < bottom:
+                        bottom = b
+                        margin = d.margin_top
+
+            margin = max(margin, p.margin_bottom) * self.unit
+            if pcb:
+                if bottom is None:
+                    p.setBottom(([y for y in ys if y > ay2] or [ys[-1]])[0] - margin)
+                else:
+                    p.setBottom(([y for y in ys if y > ay2 and y<=bottom] or [bottom])[0] - margin)
+            else:
+                if bottom is None:
+                    # move objects behind together to prevent overlapping
+                    offset = bottommost - ay2
+                    for o in todo[i+1:]:
+                        if o.directional_distance(p, (0, 1)):
+                            o.setBottom(o.bbox[3]+offset - margin)
+                    p.setBottom(bottommost - margin)
+                else:
+                    p.setBottom(min(
+                        bottom - self.state.spacing*self.unit,
+                        bottommost
+                    ) - margin)
+        self.state.scale = None
+        self.build()
+
+    def align_left(self, e, pcb=None):
+        todo = list(self.state.pcb)
+        if not todo:
+            return
+        todo.sort(key=lambda pcb: pcb.bbox[0])
+
+        leftmost = (self.state.frame_left + (self.state.spacing if self.state.frame_left > 0 else 0)) * self.unit + self.off_x
+        if pcb:
+            xs = [leftmost]
+            for p in todo:
+                x1, y1, x2, y2 = p.bbox
+                xs.append(x1)
+                xs.append(x2 + self.state.spacing * self.unit)
+                xs.append(x2 - pcb.rwidth)
+            xs.sort()
+
+        start = 0
+        end = len(todo)
+        if pcb:
+            start = todo.index(pcb)
+            end = start+1
+        for i, p in enumerate(todo[start:end], start):
+            ax1, ay1, ax2, ay2 = p.bbox
+            left = None
+            margin = 0
+            for d in todo[:i]:
+                dist = p.directional_distance(d, (-1, 0))
+                if dist is not None:
+                    l = ax1 - dist
+                    if left is None or l > left:
+                        left = l
+                        margin = d.margin_right
+
+            margin = max(margin, p.margin_left) * self.unit
+            if pcb:
+                if left is None:
+                    p.setLeft(([x for x in xs if x < ax1] or [xs[0]])[-1] + margin)
+                else:
+                    p.setLeft(([x for x in xs if x < ax1 and x>=left] or [left])[-1] + margin)
+            else:
+                if left is None:
+                    # move objects behind together to prevent overlapping
+                    offset = leftmost - ax1
+                    for o in todo[i+1:]:
+                        if o.directional_distance(p, (-1, 0)):
+                            o.setLeft(o.bbox[0]+offset + margin)
+                    p.setLeft(leftmost + margin)
+                else:
+                    p.setLeft(max(
+                        left + self.state.spacing*self.unit,
+                        leftmost
+                    ) + margin)
+        self.state.scale = None
+        self.build()
+
+    def align_right(self, e, pcb=None):
+        todo = list(self.state.pcb)
+        if not todo:
+            return
+        todo.sort(key=lambda pcb: -pcb.bbox[2])
+
+        rightmost = (self.state.frame_width - self.state.frame_right - (self.state.spacing if self.state.frame_right > 0 else 0)) * self.unit + self.off_x
+        if pcb:
+            xs = [rightmost]
+            for p in todo:
+                x1, y1, x2, y2 = p.bbox
+                xs.append(x1 - self.state.spacing * self.unit)
+                xs.append(x2)
+                xs.append(x1 + pcb.rwidth)
+            xs.sort()
+
+        start = 0
+        end = len(todo)
+        if pcb:
+            start = todo.index(pcb)
+            end = start+1
+        for i, p in enumerate(todo[start:end], start):
+            ax1, ay1, ax2, ay2 = p.bbox
+            right = None
+            margin = 0
+            for d in todo[:i]:
+                dist = p.directional_distance(d, (1, 0))
+                if dist is not None:
+                    r = ax2 + dist
+                    if right is None or r < right:
+                        right = r
+                        margin = d.margin_left
+
+            margin = max(margin, p.margin_right) * self.unit
+            if pcb:
+                if right is None:
+                    p.setRight(([x for x in xs if x > ax2] or [xs[-1]])[0] - margin)
+                else:
+                    p.setRight(([x for x in xs if x > ax2 and x<=right] or [right])[0] - margin)
+            else:
+                if right is None:
+                    # move objects behind together to prevent overlapping
+                    offset = rightmost - ax2
+                    for o in todo[i+1:]:
+                        if o.directional_distance(p, (1, 0)):
+                            o.setRight(o.bbox[2]+offset - margin)
+                    p.setRight(rightmost - margin)
+                else:
+                    p.setRight(min(
+                        right - self.state.spacing*self.unit,
+                        rightmost
+                    ) - margin)
+        self.state.scale = None
+        self.build()
+
+    def move_up(self, e):
+        pcb = self.state.focus
+        if pcb:
+            pcb.y -= self.state.move * self.unit
+            self.build()
+
+    def move_down(self, e):
+        pcb = self.state.focus
+        if pcb:
+            pcb.y += self.state.move * self.unit
+            self.build()
+
+    def move_left(self, e):
+        pcb = self.state.focus
+        if pcb:
+            pcb.x -= self.state.move * self.unit
+            self.build()
+
+    def move_right(self, e):
+        pcb = self.state.focus
+        if pcb:
+            pcb.x += self.state.move * self.unit
+            self.build()
+
+    def rotateBy(self, e, deg=90):
+        pcb = self.state.focus
+        if pcb:
+            pcb.rotateBy(deg)
+            self.build()
+
+    def toCanvas(self, x, y):
+        """
+        Convert global coordinate system to canvas coordinate system
+        """
+        offx, offy, scale = self.state.scale
+        return x * scale + offx, y * scale + offy
+
+    def fromCanvas(self, x, y):
+        """
+        Convert canvas coordinate system to global coordinate system
+        """
+        offx, offy, scale = self.state.scale
+        return (x - offx)/scale, (y - offy)/scale
+
+    def hole_handle_at(self, canvas_x, canvas_y, vertices_only=False):
+        hole = self.state.focus
+        if not self.state.show_hole or not isinstance(hole, Hole):
+            return None
+
+        vertices = hole.vertices
+        canvas_vertices = [
+            self.toCanvas(x - self.off_x, y - self.off_y)
+            for x, y in vertices
+        ]
+
+        for index, (x, y) in enumerate(canvas_vertices):
+            if math.hypot(canvas_x - x, canvas_y - y) <= HOLE_HANDLE_HIT_RADIUS:
+                return hole, "vertex", index
+
+        if vertices_only:
+            return None
+
+        for index, ((x1, y1), (x2, y2)) in enumerate(zip(
+                canvas_vertices, canvas_vertices[1:] + canvas_vertices[:1])):
+            x = (x1 + x2) / 2
+            y = (y1 + y2) / 2
+            if math.hypot(canvas_x - x, canvas_y - y) <= HOLE_HANDLE_HIT_RADIUS:
+                return hole, "midpoint", index
+
+        return None
+
+    def dblclicked(self, e):
+        if self.tool == Tool.HOLE:
+            polygon = list(self.state.edit_polygon)
+            if len(polygon)>=2:
+                polygon.append(self.fromCanvas(e.x, e.y))
+                self.state.edit_polygon = []
+                h = Hole(self, polygon)
+                self.state.holes.append(h)
+                self.state.focus = h
+                self.state.focus_tab = None
+                self.tool = Tool.END
+                self.build()
+            return
+
+        handle = self.hole_handle_at(e.x, e.y, vertices_only=True)
+        if handle is not None:
+            hole, _, vertex_index = handle
+            self.hole_double_click_handled = True
+            self.hole_handle_drag = None
+            self.mouse_dragging = None
+            if hole.remove_vertex(vertex_index):
+                self.build()
+            else:
+                self.state()
+
+    def mousedown(self, e):
+        self.state.crosshair = None
+        self.state.mousepos = e.x, e.y
+        self.mousehold = True
+        self.mousemoved = 0
+        self.mouse_action_from_inside = False
+
+        if self.tool == Tool.TAB:
+            pass
+        elif self.tool == Tool.HOLE:
+            x, y = self.fromCanvas(e.x, e.y)
+            self.state.edit_polygon.append((x,y))
+        else:
+            self.mouse_dragging = None
+            handle = self.hole_handle_at(e.x, e.y)
+            if handle is not None:
+                hole, kind, index = handle
+                self.hole_handle_drag = {
+                    "hole": hole,
+                    "kind": kind,
+                    "index": index,
+                    "changed": False,
+                }
+                return
+
+            x, y = self.fromCanvas(e.x, e.y)
+
+            p = Point(x+self.off_x, y+self.off_y)
+            if self.state.focus and self.state.focus.contains(p):
+                self.mouse_dragging = self.state.focus
+                self.mouse_action_from_inside = True
+
+
+    def mouseup(self, e):
+        self.mousehold = False
+        if self.hole_double_click_handled:
+            self.hole_double_click_handled = False
+            self.hole_handle_drag = None
+            return
+
+        if self.hole_handle_drag is not None:
+            changed = self.hole_handle_drag["changed"]
+            self.hole_handle_drag = None
+            if changed:
+                self.build()
+            return
+
+        if self.tool == Tool.TAB:
+            x, y = self.fromCanvas(e.x, e.y)
+            if self.state.focus.contains(Point(x+self.off_x, y+self.off_y)):
+                self.state.focus.addTab(x+self.off_x, y+self.off_y)
+            self.tool = Tool.NONE
+            self.build()
+        elif self.tool == Tool.HOLE:
+            pass
+        elif self.tool == Tool.END:
+            self.tool = Tool.NONE
+        else:
+            if self.mousemoved < 5:
+                found = False
+                pcbs = self.state.pcb
+                x, y = self.fromCanvas(e.x, e.y)
+                p = Point(x+self.off_x, y+self.off_y)
+
+                for hole in self.state.holes:
+                    if hole.polygon.contains(p):
+                        found = True
+                        if self.state.focus is hole:
+                            continue
+                        else:
+                            self.state.focus = hole
+                            self.state.focus_tab = None
+
+                if not found:
+                    for pcb in [pcb for pcb in pcbs if pcb is not self.state.focus]:
+                        if pcb.contains(p):
+                            found = True
+                            if self.state.focus is pcb:
+                                continue
+                            else:
+                                self.state.focus = pcb
+                                self.state.focus_tab = None
+                if not found and (self.state.focus and not self.state.focus.contains(p)):
+                    self.state.focus = None
+                    self.state.focus_tab = None
+                if self.state.focus_tab is not None:
+                    self.build()
+            else:
+                self.build()
+
+    def mousemove(self, e):
+        if self.tool == Tool.TAB or self.tool == Tool.HOLE:
+            self.state()
+        elif self.mousehold:
+            pdx = e.x - self.state.mousepos[0]
+            pdy = e.y - self.state.mousepos[1]
+            self.mousemoved += (pdx**2 + pdy**2)**0.5
+
+            x1, y1 = self.fromCanvas(*self.state.mousepos)
+            x2, y2 = self.fromCanvas(e.x, e.y)
+            dx = x2 - x1
+            dy = y2 - y1
+
+            if self.hole_handle_drag is not None:
+                drag = self.hole_handle_drag
+                hole = drag["hole"]
+
+                if (drag["kind"] == "midpoint"
+                        and self.mousemoved >= HOLE_INSERT_DRAG_THRESHOLD):
+                    vertices = hole.vertices
+                    edge_index = drag["index"]
+                    p1 = vertices[edge_index]
+                    p2 = vertices[(edge_index + 1) % len(vertices)]
+                    midpoint = ((p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2)
+                    if hole.insert_vertex(edge_index, midpoint):
+                        drag["kind"] = "vertex"
+                        drag["index"] = edge_index + 1
+                        drag["changed"] = True
+
+                if drag["kind"] == "vertex" and self.mousemoved > 0:
+                    point = (x2 + self.off_x, y2 + self.off_y)
+                    if hole.move_vertex(drag["index"], point):
+                        drag["changed"] = True
+
+                self.state()
+            elif self.state.focus and self.state.focus_tab is not None:
+                if self.mouse_action_from_inside:
+                    p = affinity.rotate(Point(dx, dy), self.state.focus.rotate*1, origin=(0,0))
+
+                    mx = self.state.focus_tab["x"] + int(p.x)
+                    my = self.state.focus_tab["y"] + int(p.y)
+
+                    if self.state.focus.contains(self.state.focus.transform(Point(mx, my))):
+                        self.state.focus_tab["x"] = mx
+                        self.state.focus_tab["y"] = my
+                else:
+                    p = affinity.rotate(Point(self.state.focus_tab["x"], self.state.focus_tab["y"]), (self.state.focus.rotate % 360)*-1, origin=(0,0))
+                    p = transform(p, lambda x: x + [self.state.focus.x + self.off_x, self.state.focus.y + self.off_y])
+
+                    dy = y2 + self.off_y - p.y
+                    dx = x2 + self.off_x - p.x
+                    angle = math.atan2(dy, dx)
+                    angle = angle * 180 / math.pi + 90
+                    self.state.focus_tab["direction"] = round(angle % 360, 2)
+            else:
+                self.state.focus = self.mouse_dragging
+
+                if self.mouse_dragging:
+                    self.mouse_dragging.x += int(dx)
+                    self.mouse_dragging.y += int(dy)
+                else:
+                    offx, offy, scale = self.state.scale
+                    offx += pdx
+                    offy += pdy
+                    self.state.scale = offx, offy, scale
+        self.state.mousepos = e.x, e.y
+
+    def wheel(self, e):
+        offx, offy, scale = self.state.scale
+        zoom_factor = 1.2  # Factor for smoother zooming
+
+        nscale = scale * (zoom_factor ** (e.v_delta / 120))
+
+        # Limit the scale
+        nscale = min(self.scale*8, max(self.scale/8, nscale))
+
+        # Calculate new offsets
+        offx = e.x - (e.x - offx) * nscale / scale
+        offy = e.y - (e.y - offy) * nscale / scale
+
+        self.state.scale = offx, offy, nscale
+
+    def keypress(self, event):
+        if isinstance(self.state.focus, PanelCell):
+            if event.text == "r":
+                self.rotateBy(-90)
+                self.build()
+            elif event.text == "R":
+                self.rotateBy(90)
+                self.build()
+
+    def add_tab(self, e):
+        self.tool = Tool.TAB
+
+    def drawPCB(self, canvas, index, pcb, highlight):
+        fill = 0x225522 if highlight else 0x112211
+        for shape in pcb.shapes:
+            self.drawShapely(canvas, transform(shape, lambda p:p-(self.off_x, self.off_y)), fill=fill)
+
+        p = pcb.transform(Point(10, 10))
+        x, y = self.toCanvas(p.x - self.off_x, p.y - self.off_y)
+        options = " ".join([f"#{k}={v}" for k,v in sorted(pcb.build_options.items())])
+        flags = " ".join([f"#{f}" for f in sorted(pcb.build_flags)])
+        canvas.drawText(x, y, f"{index}. {pcb.ident}\n{pcb.width/self.unit:.2f}*{pcb.height/self.unit:.2f}\n{options}\n{flags}", rotate=pcb.rotate*-1, color=0xFFFFFF)
+
+        offx, offy, scale = self.state.scale
+        for i, tab in enumerate(pcb.tabs()):
+            x1 = tab["x1"]
+            y1 = tab["y1"]
+            x2 = tab["x2"]
+            y2 = tab["y2"]
+            x2, y2 = extrapolate(x1, y1, x2, y2, 1, SHP_EPSILON * 2)
+            x1, y1 = self.toCanvas(x1-self.off_x, y1-self.off_y)
+            x2, y2 = self.toCanvas(x2-self.off_x, y2-self.off_y)
+            if tab["o"] == self.state.focus_tab and pcb is self.state.focus:
+                width = 3
+            else:
+                width = 1
+
+            # arrow
+            canvas.drawLine(x1, y1, x2, y2, color=0xFFFF00, width=width)
+
+            # tab width
+            ln = LineString([(x2, y2), (x1, y1)])
+            ln1 = ln.parallel_offset(tab["width"]*self.unit*scale/2, "left")
+            ln2 = ln.parallel_offset(tab["width"]*self.unit*scale/2, "right")
+            canvas.drawLine(ln1.coords[0][0], ln1.coords[0][1], ln2.coords[0][0], ln2.coords[0][1], color=0xFFFF00)
+
+    def drawLine(self, canvas, x1, y1, x2, y2, color):
+        x1, y1 = self.toCanvas(x1, y1)
+        x2, y2 = self.toCanvas(x2, y2)
+        canvas.drawLine(x1, y1, x2, y2, color=color)
+
+    def drawPolyline(self, canvas, polyline, *args, **kwargs):
+        ps = []
+        for p in polyline:
+            ps.append(self.toCanvas(*p))
+        canvas.drawPolyline(ps, *args, **kwargs)
+
+    def drawPolygon(self, canvas, polygon, stroke=None, fill=None):
+        ps = []
+        for p in polygon:
+            ps.append(self.toCanvas(*p))
+        canvas.drawPolygon(ps, stroke=stroke, fill=fill)
+
+    def drawShapely(self, canvas, shape, stroke=None, fill=None):
+        offx, offy, scale = self.state.scale
+        shape = transform(shape, lambda p:p * scale + (offx, offy))
+        canvas.drawShapely(shape, stroke=stroke, fill=fill)
+
+    def drawHoleHandles(self, canvas, hole):
+        vertices = [
+            self.toCanvas(x - self.off_x, y - self.off_y)
+            for x, y in hole.vertices
+        ]
+        half = HOLE_HANDLE_SIZE / 2
+
+        for (x1, y1), (x2, y2) in zip(vertices, vertices[1:] + vertices[:1]):
+            x = (x1 + x2) / 2
+            y = (y1 + y2) / 2
+            canvas.drawRect(
+                x - half, y - half, x + half, y + half,
+                stroke=0xFF6E00,
+                width=2,
+            )
+
+        for x, y in vertices:
+            canvas.drawRect(
+                x - half, y - half, x + half, y + half,
+                fill=0xFFCF55,
+                stroke=0x261000,
+            )
+
+    def drawVCutV(self, canvas, x):
+        x1, y1 = self.toCanvas(x-self.off_x, -VC_EXTENT*self.unit)
+        x2, y2 = self.toCanvas(x-self.off_x, (self.state.frame_height+VC_EXTENT)*self.unit)
+        canvas.drawLine(x1, y1, x2, y2, color=0x4396E2)
+
+    def drawVCutH(self, canvas, y):
+        x1, y1 = self.toCanvas(-VC_EXTENT*self.unit, y-self.off_y)
+        x2, y2 = self.toCanvas((self.state.frame_width+VC_EXTENT)*self.unit, y-self.off_y)
+        canvas.drawLine(x1, y1, x2, y2, color=0x4396E2)
+
+    def drawMousebites(self, canvas, line):
+        offx, offy, scale = self.state.scale
+        mb_diameter = self.state.mb_diameter
+        mb_spacing = self.state.mb_spacing
+        if mb_spacing == 0:
+            return
+        i = 0
+        line = line.parallel_offset(self.state.mb_offset * self.unit, "left")
+        n = int(line.length // (mb_spacing * self.unit))
+        spacing = line.length / n
+        for i in range(n + 1):
+            p = line.interpolate(i * spacing)
+            x, y = self.toCanvas(p.x-self.off_x, p.y-self.off_y)
+            canvas.drawEllipse(x, y, mb_diameter*self.unit/2*scale, mb_diameter*self.unit/2*scale, stroke=0xFFFF00)
+
+    def panelCorners(self, horizontalOffset=0, verticalOffset=0):
+        """
+        Return the list of top-left, top-right, bottom-left and bottom-right
+        corners of the panel. You can specify offsets.
+        """
+        minx, miny, maxx, maxy = self.off_x, self.off_y, self.off_x + self.state.frame_width*mm, self.off_y + self.state.frame_height*mm
+        topLeft = (minx + horizontalOffset, miny + verticalOffset)
+        topRight = (maxx - horizontalOffset, miny + verticalOffset)
+        bottomLeft = (minx + horizontalOffset, maxy - verticalOffset)
+        bottomRight = (maxx - horizontalOffset, maxy - verticalOffset)
+        return [topLeft, topRight, bottomLeft, bottomRight]
+
+    def painter(self, canvas):
+        if self.state.scale is None or (self.canvas_width, self.canvas_height) != (canvas.width, canvas.height):
+            self.autoScale(canvas.width, canvas.height)
+            return
+
+        offx, offy, scale = self.state.scale
+        pcbs = self.state.pcb
+
+        boardSubstrate = self.state.boardSubstrate
+        if boardSubstrate:
+            if isinstance(boardSubstrate, MultiPolygon):
+                geoms = boardSubstrate.geoms
+            elif isinstance(boardSubstrate, Polygon):
+                geoms = [boardSubstrate]
+            else:
+                geoms = []
+            for polygon in geoms:
+                polygon = transform(polygon, lambda p:p-(self.off_x, self.off_y))
+                self.drawShapely(canvas, polygon, fill=0x151515, stroke=0x777777)
+
+        if self.state.show_pcb:
+            # pcb areas
+            for i,pcb in enumerate(pcbs):
+                if pcb is self.state.focus:
+                    continue
+                self.drawPCB(canvas, i, pcb, False)
+
+            # focus pcb
+            for i,pcb in enumerate(pcbs):
+                if pcb is not self.state.focus:
+                    continue
+                self.drawPCB(canvas, i, pcb, True)
+
+        if not self.state.frame_pcb and self.state.use_frame and self.state.frame_tooling_holes:
+            horizontalOffset = self.state.frame_tooling_horizontal_offset * self.unit
+            verticalOffset = self.state.frame_tooling_vertical_offset * self.unit
+            holeCount = 4
+            diameter = self.state.frame_tooling_diameter * self.unit
+            solderMaskDiameter = self.state.frame_tooling_solder_mask_opening_diameter * self.unit
+            for i, pos in enumerate(self.panelCorners(horizontalOffset, verticalOffset)[:holeCount]):
+                x, y = self.toCanvas(pos[0]-self.off_x, pos[1]-self.off_y)
+                canvas.drawEllipse(x, y, solderMaskDiameter/2*scale, solderMaskDiameter/2*scale, stroke=0x84E7ED)
+                canvas.drawEllipse(x, y, diameter/2*scale, diameter/2*scale, fill=0x84E7ED)
+
+        if not self.state.frame_pcb and self.state.use_frame and self.state.fiducials:
+            diameter = self.state.fiducials_diameter * self.unit
+            solderMaskDiameter = self.state.fiducials_solder_mask_opening_diameter * self.unit
+            if self.state.frame_top and self.state.frame_bottom:
+                horizontalOffset = (self.state.frame_tooling_horizontal_offset + self.state.frame_tooling_solder_mask_opening_diameter * 4) * self.unit
+                verticalOffset = (self.state.fiducials_clearance + self.state.fiducials_diameter/2) * self.unit
+
+                for i, pos in enumerate(self.panelCorners(horizontalOffset, verticalOffset)[:4]):
+                    x, y = self.toCanvas(pos[0]-self.off_x, pos[1]-self.off_y)
+                    canvas.drawEllipse(x, y, solderMaskDiameter/2*scale, solderMaskDiameter/2*scale, stroke=0xFF00E9)
+                    canvas.drawEllipse(x, y, diameter/2*scale, diameter/2*scale, fill=0xDA1C2B)
+
+            if self.state.frame_left and self.state.frame_right:
+                horizontalOffset = (self.state.fiducials_clearance + self.state.fiducials_diameter/2) * self.unit
+                verticalOffset = (self.state.frame_tooling_vertical_offset + self.state.frame_tooling_solder_mask_opening_diameter * 4) * self.unit
+
+                for i, pos in enumerate(self.panelCorners(horizontalOffset, verticalOffset)[:4]):
+                    x, y = self.toCanvas(pos[0]-self.off_x, pos[1]-self.off_y)
+                    canvas.drawEllipse(x, y, solderMaskDiameter/2*scale, solderMaskDiameter/2*scale, stroke=0xFF00E9)
+                    canvas.drawEllipse(x, y, diameter/2*scale, diameter/2*scale, fill=0xDA1C2B)
+
+        if self.state.show_hole:
+            for hole in self.state.holes:
+                self.drawShapely(canvas, transform(hole.polygon, lambda p:p-(self.off_x, self.off_y)), stroke=0xFFCF55 if hole is self.state.focus else 0xFF6E00, fill=0x261000 if hole is self.state.focus else None)
+            if isinstance(self.state.focus, Hole):
+                self.drawHoleHandles(canvas, self.state.focus)
+
+        if self.state.show_conflicts:
+            for conflict in self.state.conflicts:
+                try:
+                    conflict = transform(conflict, lambda p:p-(self.off_x, self.off_y))
+                    self.drawShapely(canvas, conflict, fill=0xFF0000)
+                except:
+                    traceback.print_exc()
+
+        if not self.mousehold or not self.mousemoved or not self.mouse_dragging:
+            bites = self.state.bites
+            vcuts = self.state.vcuts
+            if self.state.show_mb:
+                for line in bites:
+                    self.drawMousebites(canvas, line)
+
+            if self.state.show_vc:
+                for line in vcuts:
+                    p1 = line.coords[0]
+                    p2 = line.coords[-1]
+
+                    if p1[0]==p2[0]: # vertical
+                        self.drawVCutV(canvas, p1[0])
+                    elif p1[1]==p2[1]: # horizontal
+                        self.drawVCutH(canvas, p1[1])
+
+            if self.state.debug:
+                for point, size in self.state.dbg_points:
+                    x, y = self.toCanvas(point[0]-self.off_x, point[1]-self.off_y)
+                    canvas.drawEllipse(x, y, size, size, stroke=0xFF0000)
+                for rect in self.state.dbg_rects:
+                    x1, y1 = self.toCanvas(rect[0]-self.off_x, rect[1]-self.off_y)
+                    x2, y2 = self.toCanvas(rect[2]-self.off_x, rect[3]-self.off_y)
+                    canvas.drawRect(x1, y1, x2, y2, stroke=0xFF0000)
+                for polygon in self.state.dbg_polygons:
+                    polygon = [self.toCanvas(p[0]-self.off_x, p[1]-self.off_y) for p in polygon]
+                    canvas.drawPolygon(polygon, stroke=0xFF0000)
+                for text in self.state.dbg_text:
+                    x, y = self.toCanvas(text[0]-self.off_x, text[1]-self.off_y)
+                    canvas.drawText(x, y, text[2])
+
+        edit_polygon = self.state.edit_polygon
+        if edit_polygon:
+            edit_polygon = list(edit_polygon)
+            if self.state.mousepos:
+                edit_polygon.append(self.fromCanvas(*self.state.mousepos))
+            self.drawPolyline(canvas, edit_polygon, color=0xFF6E00, width=1)
+
+        drawCross = False
+
+        if self.tool == Tool.HOLE:
+            drawCross = True
+            canvas.drawText(
+                12, 12,
+                "double click to finish the hole",
+                color=0xFF6E00,
+            )
+
+        if self.tool == Tool.TAB:
+            x, y = self.fromCanvas(*self.state.mousepos)
+            p = Point(x+self.off_x, y+self.off_y)
+            if self.state.focus.contains(p):
+                shortest = None
+                for shape in self.state.focus.shapes:
+                    s = shapely.shortest_line(p, shape.exterior)
+                    if shortest is None or s.length < shortest.length:
+                        shortest = s
+                if shortest:
+                    t0 = shortest.coords[0]
+                    t1 = shortest.coords[1]
+                    x1, y1 = t0
+                    x2, y2 = t1
+                    x2, y2 = extrapolate(x1, y1, x2, y2, 1, SHP_EPSILON * 2)
+                    x1, y1 = self.toCanvas(x1-self.off_x, y1-self.off_y)
+                    x2, y2 = self.toCanvas(x2-self.off_x, y2-self.off_y)
+
+                    # arrow
+                    canvas.drawLine(x1, y1, x2, y2, color=0xFFFF00)
+
+                    # tab width
+                    ln = LineString([(x2, y2), (x1, y1)])
+                    ln1 = ln.parallel_offset(self.state.tab_width*self.unit*scale/2, "left")
+                    ln2 = ln.parallel_offset(self.state.tab_width*self.unit*scale/2, "right")
+                    canvas.drawLine(ln1.coords[0][0], ln1.coords[0][1], ln2.coords[0][0], ln2.coords[0][1], color=0xFFFF00)
+
+        if self.state.crosshair:
+            x, y = self.state.crosshair
+            self.drawLine(canvas, x - 15 * mm, y, x + 15 * mm, y, color=0x00FF00)
+            self.drawLine(canvas, x, y - 15 * mm, x, y + 15 * mm, color=0x00FF00)
+
+    def netRenamer(self, n, orig):
+        try:
+            return self.state.netRenamePattern.format(n=n, orig=orig)
+        except:
+            return orig
+
+    def refRenamer(self, n, orig):
+        try:
+            ret = self.state.refRenamePattern.format(n=n, orig=orig)
+        except:
+            ret = orig
+
+        self.refMap[ret] = orig
+        return ret
+
+    def fit_frame(self, *args):
+        # Assuming top-left alignment
+        max_x = None
+        max_y = None
+        for pcb in self.state.pcb:
+            bbox = pcb.bbox
+            max_x = bbox[2] if max_x is None else max(max_x, bbox[2])
+            max_y = bbox[3] if max_y is None else max(max_y, bbox[3])
+        self.state.frame_width = round((max_x-self.off_x) / self.unit + self.state.frame_right + (self.state.spacing if self.state.frame_right > 0 else 0), 3)
+        self.state.frame_height = round((max_y-self.off_y) / self.unit + self.state.frame_bottom + (self.state.spacing if self.state.frame_bottom > 0 else 0), 3)
+        self.build()
+
+    def select_bom(self, e):
+        self.state.focus.bom_file = OpenFile("Select BOM", dir=os.path.dirname(self.state.focus.file), types="BOM (*.csv)|*.csv")
+
+    def select_cpl(self, e):
+        self.state.focus.cpl_file = OpenFile("Select CPL", dir=os.path.dirname(self.state.focus.file), types="CPL (*.csv)|*.csv")
+
+    def open_exported_file(self, e):
+        path = self.state.last_exported_path
+        if path and os.path.isfile(path):
+            Thread(target=self._open_exported_file, args=[path], daemon=True).start()
+        else:
+            Critical("Exported file not found", "Open Exported File")
+
+    def _open_exported_file(self, path):
+        open_pcb_file(path)
+
+    def content(self):
+        title = f"Kikakuka v{VERSION} Fabrication Planner (KiCad {pcbnew.Version()}, KiKit {kikit.__version__}, Shapely {shapely.__version__}, PUI {PUI.__version__} {PUI_BACKEND})"
+        with Window(maximize=True, title=title, icon=resource_path("icon.ico")).keypress(self.keypress):
+            with VBox():
+                with HBox().layout(weight=1):
+                    self.state.redraw
+                    self.state.scale
+                    self.state.pcb
+                    self.state.bites
+                    self.state.vcuts
+                    self.state.cut_method
+                    self.state.mb_diameter
+                    self.state.mb_spacing
+                    self.state.mousepos
+                    self.state.focus_tab
+                    self.state.crosshair
+                    (Canvas(self.painter)
+                        .dblclick(self.dblclicked)
+                        .mousedown(self.mousedown)
+                        .mouseup(self.mouseup)
+                        .mousemove(self.mousemove)
+                        .wheel(self.wheel)
+                        .layout(weight=1)
+                        .style(bgColor=0x000000))
+
+                    with VBox().layout(width=800):
+                        with HBox():
+                            Label("Panel")
+                            Button("Load").click(self.load)
+                            Button("Save").click(self.save)
+
+                            Spacer()
+
+                            if self.state.last_exported_path:
+                                Button("Open Exported File").click(self.open_exported_file)
+                            Button("Export").click(self.build, export=True)
+
+                        with HBox():
+                            Label("Add")
+                            Button("KiCad PCB").click(self.addKiCad)
+                            Button("Gerber Folder").click(self.addGerberFolder)
+                            Button("Gerber Zip").click(self.addGerberZip)
+                            Button("Hole").click(self.addHole)
+                            Spacer()
+
+                        with HBox():
+                            Label("Export Options")
+
+                            Label("V-Cut Layer")
+                            with ComboBox(editable=False, text_model=self.state("vc_layer")):
+                                ComboBoxItem("Cmts.User")
+                                ComboBoxItem("User.1")
+                                ComboBoxItem("Edge.Cuts")
+
+                            if len(self.state.pcb) > 1:
+                                Checkbox("Hide Out-of-Board References/Values", self.state("hide_outside_reference_value"))
+
+                            Checkbox("Export Simulated Mill Fillets", self.state("export_mill_fillets"))
+
+                            Spacer()
+
+                        with HBox():
+                            Label("Display Options")
+                            Checkbox("PCB", self.state("show_pcb"))
+                            Checkbox("Hole", self.state("show_hole"))
+                            Checkbox("Mousebites", self.state("show_mb"))
+                            Checkbox("V-Cut", self.state("show_vc"))
+                            Checkbox("Conflicts", self.state("show_conflicts")).click(self.build)
+                            Spacer()
+                            Checkbox("Debug", self.state("debug")).click(self.build)
+
+
+                        if self.state.debug:
+                            with HBox().id("debug-display"):
+                                Label("Debug Display")
+                                Checkbox("PCB Bounding Box", self.state("debug_bbox")).click(self.build)
+                                Spacer()
+
+                        Divider()
+
+                        with HBox():
+                            Label("Global Settings")
+                            Spacer()
+                            Label("Unit: mm")
+
+                        with HBox():
+                            if self.state.frame_pcb:
+                                Button("Clear Frame PCB").click(self.clear_frame_pcb)
+                            else:
+                                Button("Use Frame PCB").click(self.use_frame_pcb)
+                                Checkbox("Use Frame", self.state("use_frame")).click(self.build)
+                            if self.state.use_frame or self.state.frame_pcb:
+                                Checkbox("Tight", self.state("tight")).click(self.build)
+                                if self.state.tight and self.state.spacing == 0:
+                                    Button("Generate Holes").click(self.generate_holes)
+                            Checkbox("Auto Tab", self.state("auto_tab")).click(self.build)
+                            Label("Max Tab Spacing")
+                            TextField(self.state("max_tab_spacing")).layout(width=50).change(self.build)
+
+                            Label("Cut Method")
+                            with ComboBox(editable=False, text_model=self.state("cut_method")).change(self.build):
+                                ComboBoxItem("V-Cuts or Mousebites", "vc_or_mb")
+                                ComboBoxItem("V-Cuts and Mousebites", "vc_and_mb")
+                                ComboBoxItem("Mousebites", "mb")
+                                ComboBoxItem("V-Cut", "vc_or_skip")
+                                if self.state.debug:
+                                    ComboBoxItem("V-Cut (Unsafe)", "vc_unsafe")
+                                ComboBoxItem("None", "none")
+
+                            Spacer()
+
+                        if not self.state.frame_pcb and self.state.use_frame:
+                            with HBox().id("frame-tooling"):
+                                Checkbox("Tooling Holes", self.state("frame_tooling_holes")).click(self.build)
+                                Label("Horizontal Offset")
+                                TextField(self.state("frame_tooling_horizontal_offset")).change(self.build)
+                                Label("Vertical Offset")
+                                TextField(self.state("frame_tooling_vertical_offset")).change(self.build)
+                                Label("Diameter")
+                                TextField(self.state("frame_tooling_diameter")).change(self.build)
+                                Label("Solder Mask Opening Diameter")
+                                TextField(self.state("frame_tooling_solder_mask_opening_diameter")).change(self.build)
+
+                            with HBox().id("fiducials"):
+                                Checkbox("Fiducials", self.state("fiducials")).click(self.build)
+                                Label("Clearance")
+                                TextField(self.state("fiducials_clearance")).change(self.build)
+                                Label("Diameter")
+                                TextField(self.state("fiducials_diameter")).change(self.build)
+                                Label("Solder Mask Opening Diameter")
+                                TextField(self.state("fiducials_solder_mask_opening_diameter")).change(self.build)
+                                Label("Layer")
+                                with ComboBox(editable=False, text_model=self.state("fiducials_layer")).click(self.build):
+                                    ComboBoxItem("Top")
+                                    ComboBoxItem("Bottom")
+                                    ComboBoxItem("Both")
+
+                            with HBox().id("copperfill"):
+                                Label("Copperfill")
+                                with ComboBox(editable=False, text_model=self.state("copperfill")).click(self.build):
+                                    ComboBoxItem("None")
+                                    ComboBoxItem("Solid")
+                                    ComboBoxItem("Hatched")
+                                    ComboBoxItem("Hex")
+                                Label("Layer")
+                                with ComboBox(editable=False, text_model=self.state("copperfill_layer")).click(self.build):
+                                    ComboBoxItem("Top")
+                                    ComboBoxItem("Bottom")
+                                    ComboBoxItem("Both")
+                                    ComboBoxItem("All")
+                                Label("Clearance")
+                                TextField(self.state("copperfill_clearance")).change(self.build)
+                                Label("Edge Clearance")
+                                TextField(self.state("copperfill_edge_clearance")).change(self.build)
+                            if self.state.copperfill == "Hatched":
+                                with HBox().id("copperfill.hatched"):
+                                    Label("Hatched Copperfill")
+                                    Label("Stroke Width")
+                                    TextField(self.state("copperfill_hatched_stroke_width")).change(self.build)
+                                    Label("Stroke Spacing")
+                                    TextField(self.state("copperfill_hatched_stroke_spacing")).change(self.build)
+                                    Label("Orientation")
+                                    TextField(self.state("copperfill_hatched_orientation")).change(self.build)
+                            if self.state.copperfill == "Hex":
+                                with HBox().id("copperfill.hex"):
+                                    Label("Hex Copperfill")
+                                    Label("Diameter")
+                                    TextField(self.state("copperfill_hex_diameter")).change(self.build)
+                                    Label("Space")
+                                    TextField(self.state("copperfill_hex_space")).change(self.build)
+                                    Label("Threshold")
+                                    TextField(self.state("copperfill_hex_threshold")).change(self.build)
+
+                        with HBox():
+                            Label("PCB Spacing")
+                            TextField(self.state("spacing")).change(self.build)
+
+                            Label("Tab Width")
+                            TextField(self.state("tab_width")).change(self.build)
+
+                            Label("Simulate Mill Fillets")
+                            TextField(self.state("mill_fillets")).change(self.build)
+
+                            Checkbox("Merge V-Cuts within", self.state("merge_vcuts")).click(self.build)
+                            TextField(self.state("merge_vcuts_threshold")).change(self.build)
+
+                            Spacer()
+
+                        with HBox():
+                            Label("Mousebites")
+                            Label("Spacing")
+                            TextField(self.state("mb_spacing")).change(self.build)
+                            Label("Diameter")
+                            TextField(self.state("mb_diameter")).change(self.build)
+                            Label("Offset")
+                            TextField(self.state("mb_offset")).change(self.build)
+                            Spacer()
+
+                        if not self.state.frame_pcb and self.state.use_frame:
+                            with HBox().id("frame-size"):
+                                Label("Frame Size")
+                                Label("Width")
+                                TextField(self.state("frame_width")).change(self.build)
+                                Label("Height")
+                                TextField(self.state("frame_height")).change(self.build)
+
+                                Button("Fit").click(self.fit_frame)
+
+                                Spacer()
+
+                                Label("Edge Rail")
+                                Label("Top")
+                                TextField(self.state("frame_top")).change(self.build)
+                                Label("Bottom")
+                                TextField(self.state("frame_bottom")).change(self.build)
+                                Label("Left")
+                                TextField(self.state("frame_left")).change(self.build)
+                                Label("Right")
+                                TextField(self.state("frame_right")).change(self.build)
+
+                        if len(self.state.pcb) > 1:
+                            with HBox().id("renamer"):
+                                Label("Rename")
+                                Label("Net")
+                                TextField(self.state("netRenamePattern")).change(self.build)
+                                Label("Ref")
+                                TextField(self.state("refRenamePattern")).change(self.build)
+
+                        with HBox():
+                            Label("Align")
+                            Button("⤒ Top").click(self.align_top)
+                            Button("⤓ Bottom").click(self.align_bottom)
+                            Button("⇤ Left").click(self.align_left)
+                            Button("⇥ Right").click(self.align_right)
+                            Spacer()
+
+                        if self.state.pcb:
+                            with Scroll().layout(weight=1):
+                                with VBox():
+                                    if isinstance(self.state.focus, PanelCell):
+                                        with HBox():
+                                            Label(f"Selected PCB: {self.state.pcb.index(self.state.focus)}. {self.state.focus.ident}")
+
+                                            Spacer()
+
+                                            Button("Duplicate").click(self.duplicate, self.state.focus)
+                                            Button("Remove").click(self.remove, self.state.focus)
+
+                                        if self.state.focus.file_type == "gerber":
+                                            with HBox():
+                                                Label("BOM")
+                                                if self.state.focus.bom_file:
+                                                    Label(os.path.basename(self.state.focus.bom_file)).layout(weight=1)
+                                                Button("Select").click(self.select_bom)
+                                                if not self.state.focus.bom_file:
+                                                    Spacer()
+
+                                            with HBox():
+                                                Label("CPL")
+                                                if self.state.focus.cpl_file:
+                                                    Label(os.path.basename(self.state.focus.cpl_file)).layout(weight=1)
+                                                Button("Select").click(self.select_cpl)
+                                                if not self.state.focus.cpl_file:
+                                                    Spacer()
+                                        if self.state.focus.avail_options:
+                                            Label("Build Options")
+                                            for k, vs in self.state.focus.avail_options.items():
+                                                with HBox():
+                                                    Label(k)
+                                                    with ComboBox(editable=False, text_model=self.state.focus.build_options(k)):
+                                                        for v in vs:
+                                                            ComboBoxItem(v)
+                                                    Spacer()
+
+                                        if self.state.focus.avail_flags:
+                                            Label("Build Flags")
+                                            for flag in self.state.focus.avail_flags:
+                                                Checkbox(flag, self.state.focus("build_flags"), value=flag)
+
+                                        with Grid():
+                                            r = 0
+
+                                            Label("Source area tolerance").grid(row=r, column=0)
+                                            with HBox().grid(row=r, column=1):
+                                                TextField(self.state.focus("tolerance")).layout(width=32).change(self.build)
+                                                Label("Expand the source area to include items slightly outside the board outline.")
+                                                Spacer()
+                                            r += 1
+
+
+                                            Label("Alignment Clearance").grid(row=r, column=0)
+                                            with HBox().grid(row=r, column=1):
+                                                Label("Top")
+                                                TextField(self.state.focus("margin_top")).change(self.build)
+                                                Label("Bottom")
+                                                TextField(self.state.focus("margin_bottom")).change(self.build)
+                                                Label("Left")
+                                                TextField(self.state.focus("margin_left")).change(self.build)
+                                                Label("Right")
+                                                TextField(self.state.focus("margin_right")).change(self.build)
+                                            r += 1
+
+                                            Label("Rotate").grid(row=r, column=0)
+                                            with HBox().grid(row=r, column=1):
+                                                Button("↺ (r)").click(self.rotateBy, 90)
+                                                Button("↺ 15°").click(self.rotateBy, 15)
+                                                TextField(self.state.focus("rotate")).change(self.build)
+                                                Button("↻ 15°").click(self.rotateBy, -15)
+                                                Button("↻ (R)").click(self.rotateBy, -90)
+                                                Spacer()
+                                            r += 1
+
+                                            Label("Move").grid(row=r, column=0)
+                                            with HBox().grid(row=r, column=1):
+                                                TextField(self.state("move")).change(self.build)
+                                                Button("⤒ Up").click(self.move_up)
+                                                Button("⤓ Down").click(self.move_down)
+                                                Button("⇤ Left").click(self.move_left)
+                                                Button("⇥ Right").click(self.move_right)
+                                                Spacer()
+                                            r += 1
+
+                                            Label("Move to align").grid(row=r, column=0)
+                                            with HBox().grid(row=r, column=1):
+                                                Button("⤒ Up").click(self.align_top, pcb=self.state.focus)
+                                                Button("⤓ Down").click(self.align_bottom, pcb=self.state.focus)
+                                                Button("⇤ Left").click(self.align_left, pcb=self.state.focus)
+                                                Button("⇥ Right").click(self.align_right, pcb=self.state.focus)
+                                                Spacer()
+                                            r += 1
+
+                                            Label("Tabs").grid(row=r, column=0)
+                                            with HBox().grid(row=r, column=1):
+                                                Button("Add").click(self.add_tab)
+                                                Spacer()
+                                            r += 1
+
+                                            for i, tab in enumerate(self.state.focus.tabs()):
+                                                selected = (self.state.focus_tab is tab["o"])
+                                                prefix = "*" if selected else " "
+                                                Label(f"{prefix} Tab {i+1}").grid(row=r, column=0)
+                                                with HBox().grid(row=r, column=1):
+                                                    Button("Select").click(self.select_tab, tab)
+                                                    Button("Remove").click(self.remove_tab, tab)
+                                                    Label("Width")
+                                                    TextField(self.state.focus._tabs[i]("width")).change(self.build)
+                                                    Checkbox("To the closest point on the edge", self.state.focus._tabs[i]("closest")).click(self.build)
+                                                    if not self.state.focus._tabs[i]["closest"]:
+                                                        Label("Direction")
+                                                        TextField(self.state.focus._tabs[i]("direction")).change(self.build)
+                                                    Spacer()
+                                                r += 1
+
+                                    elif self.state.holes:
+                                        Label("Holes")
+                                        for i, hole in enumerate(self.state.holes):
+                                            selected = (self.state.focus is hole)
+                                            prefix = "*" if selected else " "
+
+                                            with HBox():
+                                                Label(f"{prefix} Hole {i+1}")
+                                                Button("Select").click(self.select_hole, hole)
+                                                Button("Remove").click(self.remove, hole)
+                                                Spacer()
+
+                                    Spacer()
+                        else:
+                            Spacer()
+
+                        with HBox():
+                            Label(f"Conflicts: {len(self.state.conflicts)}")
+                            Spacer()
+                            Label(f"Memory: {psutil.Process().memory_info().rss / 1024 / 1024:.2f} MB")
+
+                with Scroll().layout(height=120).style(bgColor=0x000000):
+                    with VBox():
+                        errors = list(self.state.errors)
+                        for pcb in self.state.pcb:
+                            errors.extend(pcb.permanent_errors)
+                            errors.extend(pcb.errors)
+                        for error in errors:
+                            (Label(error, selectable=True)
+                                .style(color=0xFF0000)
+                                .click(self.click_message, error))
+                        for warning in self.state.warnings:
+                            (Label(warning, selectable=True)
+                                .style(color=0xFFCF55)
+                                .click(self.click_message, warning))
+
+                        Spacer()
+
+    def click_message(self, e, message):
+        number = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
+        m = re.search(rf"({number})\s+({number})", message)
+        if m:
+            self.state.crosshair = (float(m.group(1)), float(m.group(2)))
+        else:
+            self.state.crosshair = None

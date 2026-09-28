@@ -1,0 +1,11 @@
+KiKit>=1.8.1
+shapely>=2.0.7
+PySide6_Essentials
+QPUIQ>=0.47
+pypdfium2==5.4.0
+opencv-python
+psutil
+pywin32; platform_system == "Windows"
+pygit2
+parsimonious
+kicad-python>=0.8,<0.9

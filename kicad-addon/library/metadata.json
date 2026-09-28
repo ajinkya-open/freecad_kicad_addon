@@ -1,0 +1,25 @@
+{
+    "$schema": "https://go.kicad.org/pcm/schemas/v2",
+    "name": "Kikakuka Library",
+    "description": "Kikakuka footprints and their supporting 3D models.",
+    "description_full": "A KiCad library for Kikakuka workflows. It provides the CouplerFixed, CouplerMoving, and CouplerAt footprints used by FreekiCAD assembly alignment, their optional helper 3D models, a unit-cube placeholder model, and the Variable and StringTemplate footprints used by the Fabrication Planner.",
+    "identifier": "com.github.buganini.kikakuka-footprints",
+    "type": "library",
+    "author": {
+        "name": "Buganini Chiu",
+        "contact": {
+            "web": "https://github.com/buganini"
+        }
+    },
+    "license": "MIT",
+    "resources": {
+        "homepage": "https://github.com/buganini/Kikakuka"
+    },
+    "versions": [
+        {
+            "version": "8.1.1",
+            "status": "stable",
+            "kicad_version": "10.0"
+        }
+    ]
+}

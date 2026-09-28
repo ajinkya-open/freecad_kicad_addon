@@ -1,0 +1,217 @@
+{
+    "export_path": "",
+    "hide_outside_reference_value": true,
+    "frame_pcb": "",
+    "use_frame": true,
+    "tight": true,
+    "auto_tab": true,
+    "spacing": 1.6,
+    "max_tab_spacing": 50.0,
+    "cut_method": "vc_and_mb",
+    "mb_diameter": 0.6,
+    "mb_spacing": 0.9,
+    "mb_offset": 0.0,
+    "tab_width": 3.6,
+    "vc_layer": "Cmts.User",
+    "merge_vcuts": true,
+    "merge_vcuts_threshold": 0.4,
+    "frame_width": 166.596,
+    "frame_height": 100.71,
+    "frame_top": 5,
+    "frame_bottom": 5,
+    "frame_left": 0,
+    "frame_right": 0,
+    "mill_fillets": 0.0,
+    "export_mill_fillets": false,
+    "netRenamePattern": "Board_{n}-{orig}",
+    "refRenamePattern": "Board_{n}-{orig}",
+    "frame_tooling_holes": true,
+    "frame_tooling_horizontal_offset": 3.5,
+    "frame_tooling_vertical_offset": 3.5,
+    "frame_tooling_diameter": 1.152,
+    "frame_tooling_solder_mask_opening_diameter": 1.3,
+    "fiducials": true,
+    "fiducials_layer": "Both",
+    "fiducials_clearance": 3.35,
+    "fiducials_diameter": 1.0,
+    "fiducials_solder_mask_opening_diameter": 2.0,
+    "copperfill": "Hex",
+    "copperfill_layer": "Both",
+    "copperfill_clearance": 1,
+    "copperfill_edge_clearance": 1,
+    "copperfill_hatched_stroke_width": 1,
+    "copperfill_hatched_stroke_spacing": 1,
+    "copperfill_hatched_orientation": 45,
+    "copperfill_hex_diameter": 7,
+    "copperfill_hex_space": 0.5,
+    "copperfill_hex_threshold": 0.25,
+    "pcb": [
+        {
+            "file": "circle.kicad_pcb",
+            "x": 74151441,
+            "y": 25982177.716220774,
+            "margin_left": 0,
+            "margin_right": 0,
+            "margin_top": 0,
+            "margin_bottom": 0,
+            "rotate": 0,
+            "options": {},
+            "flags": [],
+            "tabs": [
+                {
+                    "x": 8500013.333333328,
+                    "y": 20566682.0,
+                    "width": 3.6,
+                    "closest": true,
+                    "direction": 0.0
+                }
+            ],
+            "bom": "",
+            "cpl": ""
+        },
+        {
+            "file": "25x12.kicad_pcb",
+            "x": 73227538.54804888,
+            "y": 75578805.95776823,
+            "margin_left": 0,
+            "margin_right": 0,
+            "margin_top": 0,
+            "margin_bottom": 0,
+            "rotate": 45,
+            "options": {},
+            "flags": [],
+            "tabs": [
+                {
+                    "x": 13967626.293177623,
+                    "y": 8775026.650459202,
+                    "width": 6.0,
+                    "closest": true,
+                    "direction": 0.0
+                }
+            ],
+            "bom": "",
+            "cpl": ""
+        },
+        {
+            "file": "rounded.kicad_pcb",
+            "x": 36924797,
+            "y": 74109752.0,
+            "margin_left": 0,
+            "margin_right": 0,
+            "margin_top": 0,
+            "margin_bottom": 0,
+            "rotate": 0,
+            "options": {},
+            "flags": [],
+            "tabs": [
+                {
+                    "x": 26511202.62346518,
+                    "y": 17014128.158511803,
+                    "width": 3.6,
+                    "closest": true,
+                    "direction": 0.0
+                }
+            ],
+            "bom": "",
+            "cpl": ""
+        },
+        {
+            "file": "25x12.kicad_pcb",
+            "x": 7748126.451951146,
+            "y": 69800000.0,
+            "margin_left": 0,
+            "margin_right": 0,
+            "margin_top": 0,
+            "margin_bottom": 0,
+            "rotate": 0,
+            "options": {},
+            "flags": [],
+            "tabs": [
+                {
+                    "x": 13967626.293177623,
+                    "y": 8775026.650459202,
+                    "width": 3.6,
+                    "closest": true,
+                    "direction": 0.0
+                },
+                {
+                    "x": 2418541.548048854,
+                    "y": 6109815.421123952,
+                    "width": 3.6,
+                    "closest": true,
+                    "direction": 0.0
+                }
+            ],
+            "bom": "",
+            "cpl": ""
+        },
+        {
+            "file": "25x12.kicad_pcb",
+            "x": 67869814,
+            "y": 6600000.0,
+            "margin_left": 0,
+            "margin_right": 0,
+            "margin_top": 0,
+            "margin_bottom": 0,
+            "rotate": 0,
+            "options": {},
+            "flags": [],
+            "tabs": [],
+            "bom": "",
+            "cpl": ""
+        },
+        {
+            "file": "gerber/jlcpcb/production_files/GERBER-gerber.zip",
+            "x": 18989000.47033631,
+            "y": 8314716.215210274,
+            "margin_left": 0,
+            "margin_right": 0,
+            "margin_top": 0,
+            "margin_bottom": 0,
+            "rotate": -15,
+            "options": {},
+            "flags": [],
+            "tabs": [
+                {
+                    "x": 28636845.48288323,
+                    "y": 3514331.4562773164,
+                    "width": 3.6,
+                    "closest": true,
+                    "direction": 0.0
+                },
+                {
+                    "x": 39083525.96508968,
+                    "y": 37878669.27942185,
+                    "width": 3.6,
+                    "closest": true,
+                    "direction": 0.0
+                },
+                {
+                    "x": 1967856.936257571,
+                    "y": 35745639.6601085,
+                    "width": 3.6,
+                    "closest": true,
+                    "direction": 0.0
+                }
+            ],
+            "bom": "gerber/jlcpcb/production_files/BOM-gerber.csv",
+            "cpl": "gerber/jlcpcb/production_files/CPL-gerber.csv"
+        },
+        {
+            "file": "gerber/gerber.kicad_pcb",
+            "x": 116595518,
+            "y": 19855606.47091493,
+            "margin_left": 0,
+            "margin_right": 0,
+            "margin_top": 0,
+            "margin_bottom": 0,
+            "rotate": 0,
+            "options": {},
+            "flags": [],
+            "tabs": [],
+            "bom": "",
+            "cpl": ""
+        }
+    ],
+    "hole": []
+}

@@ -1,0 +1,369 @@
+# 8.0:
+* TL;DR
+    * Faster PCB and schematic diffs with improved viewing controls
+    * Faster FPC bending
+    * Seamless FreeCAD navigation
+* FreekiCAD
+    * Accept a single `.kicad_pcb` as direct input to `kkkk_export.py`
+    * Allow custom stiffener materials with a warning and Polyimide color/opacity defaults
+    * Update coupler placements from cached bend-partition transforms without rebending the board
+    * Improve initial bending and rebending performance by roughly 7-12x on representative multi-bend FPC benchmarks through 2D partitioning, reusable geometry caches, and optimized wedge construction
+    * Fix bend traversal across adjacent wedge pieces
+    * Prepare package metadata, icons, scripts, screenshots, and documentation for FreeCAD Addon Manager submission
+    * Host a local IPC Instance Manager node in each FreeCAD process, including FreeCADCmd, so linked KiCad boards work without a running Workspace Manager; GUI FreeCAD also publishes document open/save/close state
+* Differ
+    * Add a shared PDF tile scheduler for PCB and schematic diffs, with cached adaptively prioritized viewport tiles, coarse previews, physical-pixel LOD fallback, and cancellation outside the viewport
+    * Render PCB layer PDFs through grayscale compositing and direct QImage buffers; equal-resolution full-page builds are roughly 5x faster, while the documented visible-area benchmark is about 16x faster
+    * Render selected schematic vector PDF pages through reusable PDFium buffers instead of fixed-resolution full-page intermediates
+    * Add synchronized previous/next page controls for schematic comparisons
+    * Fill the unset comparison side automatically when selecting the first file
+    * Limit PCB revision selectors to commits that changed the selected board file; schematic selectors retain all repository commits to account for changes in hierarchical sheets
+    * Increase PCB diff zoom to 64x with sharper high-zoom rasterization and more efficient tile compositing
+    * Set the comparison overlap as 0–30% of the viewport width, with linear Ctrl+Wheel adjustment
+    * Add KiCad-ordered layer controls, visibility presets, and a flipped board view
+    * Open either selected working-tree or historical KiCad file through the Instance Manager mesh, with a system fallback when no node runs and clear errors for missing revision files
+* Workspace Manager
+    * Replace the single `kikakuka.sock` daemon with a per-user local IPC Instance Manager mesh: on-demand discovery, lowest-PID capable executor election, failover, serialized per-file and per-program launches, and replicated PID state
+    * Open or focus KiCad and FreeCAD files through the Instance Manager mesh, verifying existing KiCad PCB mappings against its IPC API
+* Panelizer
+    * Open exported boards through the Instance Manager mesh, falling back to the system file association only when no node is running
+
+# 7.5:
+* FreekiCAD
+    * Add `CouplerAt` for absolute FreeCAD world positioning with `TargetX`, `TargetY`, and `TargetZ`, replacing `CouplerOrigin`
+    * Add `Offset` to `CouplerFixed` and `CouplerMoving` for displacement along the footprint triangle direction without moving the footprint origin
+    * Register `.kicad_pcb` with FreeCAD so Open, Import, and drag-and-drop create linked PCB objects
+    * Fix FreeCAD-to-KiCad component movement synchronization on bent PCBs while ignoring unrelated placement notifications
+* KiCad Footprint Addon
+    * Package the public Kikakuka footprint library as a KiCad addon with descriptions, archive generation, and publish metadata tooling
+
+# 7.4:
+* FreekiCAD
+    * Fix solder-mask color fallback when the stackup has no explicit mask color
+
+# 7.3:
+* FreekiCAD
+    * Export FreeCAD Assembly and `App::Link` instances as flattened `.kkkk_asm` placement snapshots
+    * Avoid unnecessary linked-file reloads during Assembly workbench recomputes
+    * Ignore unrelated Assembly workbench edit events in the PCB outline observer
+
+# 7.1:
+* FreekiCAD
+    * Add named, material-aware solid stiffeners from annotated `F.Stiffener` and `B.Stiffener` layers, cut by same-side solder-mask openings
+    * Accept micrometres (`um`) and mils (`mil`, 0.001 inch) for stiffener thickness and coupler Z offsets
+    * Add portable `.kkkk_asm` assemblies with independently reloadable PCB/STEP objects and Workspace Manager integration
+    * Add `kkkk_export.py` for headless `.kkkk_asm` to STEP export with `freecadcmd`
+    * Add optional copper, solder-mask, and silkscreen display layers without changing finished component Z
+    * Add automatic multi-board alignment and live synchronization through editable couplers
+    * Improve linked-file reload reliability, material appearance, and relative-path handling
+    * Report a missing `kicad-python` dependency as an error when loading PCB objects
+* Workspace Manager
+    * Serialize simultaneous KiCad editor launches to avoid PID and IPC socket conflicts
+* Panelizer / Fabrication Planner
+    * Accept multi-board `.kicad_pcb` files
+    * Add `Variable` and `StringTemplate` footprints for build-dependent text
+    * Add vertex and midpoint-handle editing for panel holes
+    * Rename `.kikit_pnl` to `.kkkk_fab`
+    * Rename the Panelizer to Fabrication Planner
+    * Preserve FreekiCAD bend drawings across panels using one collision-free canonical layer
+
+# 6.12:
+* Panelizer
+    * Automatically reload modified PCB files and rebuild the panel
+    * Add a button to open the most recently exported board
+    * Load a multiboard file as multiple objects #33
+    * Preserve alignment clearance when cloning panel cells
+    * Fix saving panel files
+    * Show the complete traceback when loading a PCB fails
+    * Ignore empty build variant fields when collecting and applying build settings
+* Workspace Manager
+    * Support adding .FCStd and .step files
+    * Reuse a pending KiCad instance while waiting for its IPC API instead of opening duplicate instances
+    * Rebuild the filepath-to-PID map from existing KiCad IPC sockets at startup
+    * Display the kipy version in the window title
+* Differ
+    * Show short commit hashes in revision history
+    * Hide commit timestamps and show longer commit subjects in revision history
+* FreekiCAD
+    * Add and pin kicad-python to the 0.8 release series
+    * Support circular Edge.Cuts outlines containing cutouts
+    * Import STEP assemblies in merged mode independently of FreeCAD's global import preferences
+    * Preserve footprint 3D models when synchronizing component placement to KiCad
+    * Prevent board reloads from triggering component move synchronization
+    * Skip 3D models for footprints marked DNP
+    * Make Reload All reload linked boards even when file timestamps are unchanged
+
+# 6.10:
+* Panelizer
+    * Recalculate autoscale when canvas size changes
+    * Update message panel background color
+* Differ
+    * Recalculate autoscale when canvas size changes
+
+# 6.9:
+* Panelizer
+    * Copy first PCB constraints to panel
+    * Integrate KiKit copperfill function #32
+    * Add fiducial layer selector #32
+    * Add panel cell source area tolerance #30
+    * Move warnings and errors to a standalone panel #32
+    * Show a crosshair when clicking messages with coordinates
+    * Work around KiCad project settings save crash
+* FreekiCAD
+    * Wait for KiCad board API readiness
+    * Avoid reusing unverified KiCad sockets
+* Add release workflow with submodule support
+* Update KiKit to 1.8.1
+* Update PUI
+* Add hard discontinued sample board
+
+# 6.8
+* Panelizer
+    * Display build exceptions as warnings
+    * Display a warning for unsupported Shapely versions
+    * Warn on mouse bites along curved edges
+    * Patch KiKit outline chaining tolerance
+* Add all-samples test runner
+* Add discontinued sample board
+* Update documentation
+
+# 6.7
+* Gerber: fix KiCad 10 compatibility
+* Add memory appendBoard test
+* Update documentation
+
+# 6.6
+* Panelizer
+    * Reuse loaded PCB to reduce memory footprint
+
+# 6.5
+* Panelizer
+    * Restore board layer/thickness check
+    * Avoid appendBoard in non-exporting build
+    * Speed up non-exporting build
+    * Process footprint/silkscreen only in exporting build
+    * Reduce render trigger
+
+# 6.4
+* Panelizer
+    * Run garbage collection after build
+    * Prevent silent build errors
+    * Early return when there is no PCB
+* Update Shapely to 2.0.7
+* Update PUI
+* Fix Windows build missing DLLs
+
+# 6.3
+* Differ: make Windows KiCad CLI path version-agnostic
+* Update Windows instructions
+
+# 6.2
+* Workspace Manager
+    * Deduplicate files
+    * Set directory for workspace-to-new-panelization flow
+* Panelizer: omit tooling holes and fiducials when frame is not used
+* Update PUI
+
+# 6.1
+* FreekiCAD
+    * Add flex PCB bending support via User.4 layer bend lines
+    * Support bend angle/radius from User.4 text annotations
+    * Improve bend cutting, wedge reconstruction, adjacency handling, and debug views
+    * Move components with bent board geometry
+    * Improve KiCad IPC readiness handling and retry logging
+    * Add FPC/maze/radius bending samples and screenshot
+* Fix KiCad 10 BUILDEXPR compatibility #28
+* Gerber: exclude NPTH in string matching in find_PTH() #29
+* Update KiKit
+
+# 6.0
+* Add FreekiCAD addon for linking KiCad boards into FreeCAD
+    * Render board outlines, drill holes, colors, and 3D models
+    * Support outline editing through FreeCAD sketches
+    * Add auto-reload and per-object reload
+    * Add KiCad/FreeCAD workspace bus integration
+    * Support KiCad IPC socket discovery on macOS, Windows, and Linux/POSIX
+    * Improve STEP model loading, color extraction, reuse, and reload performance
+* Update README with FreekiCAD setup notes
+* Add .gitignore files and remove committed pyc files
+
+# 5.9
+* Panelizer
+    * Support frame PCB
+    * Add tolerance for v-cuts building #27
+    * Fix auto tabbing bug
+    * Avoid loading empty frame PCB
+    * Display memory usage
+* Add rounded 8x8 panel sample
+* Update pypdfium2 to 5.4.0
+* Update PUI for Canvas.drawShapely()
+
+# 5.8
+* Panelizer
+    * Implement build options
+    * Fix build variants for boards not renamed
+    * Display PCB loading errors
+* Differ: enumerate layers in kicad_pcb
+* Workspace Manager: save .kkkk with ensure_ascii=False
+* Update README with git submodule instructions
+* Update PUI
+
+# 5.7
+* Panelizer: add buttons for adding gerber folder & gerber zip
+
+# 5.6:
+* Gerber: write footprint name to the converted .kicad_pcb
+
+# 5.5:
+* Experimental Gerber support
+    * Allow attaching BOM/CPL (converted to reference-only footprints)
+* Add tooling holes
+* Add fiducials
+* Fix opening differ
+
+# 5.4
+* trim flags
+
+# 5.3
+* fix extracting flags from BUILDEXPR containing parentesis
+
+# 5.2
+* Panelizer
+    * Fix island removal
+
+# 5.1
+* Workspace Manager:
+    * Convert to relative path: don't convert non-existent path
+
+# 5.0
+* Panelizer
+    * Support spacing=0 #22
+    * Add frame size "Fit" button #22
+    * Add pcb clearance setting #22
+    * Add "move by distance" function
+    * Wrap rotation to 360 deg to work around numerical errors #22
+    * Update the render function to improve the display of the substrate area.
+    * Add vcut_or_skip and hidden vcut_unsafe cut methods
+    * Add "Generate Holes" for user to determine which area should be holes/fills in tight frame + zero-spacing scenario #22
+    * Fix mousebites offset by preserving cut line direction #23
+    * Add configurable angle setting for manual tabs #24
+    * Tabs: better handling of non-perpendicular approaching angle #24
+
+* Built variants
+
+* Workspace Manager:
+    * Display libraries
+    * "Convert to relative path" button (related to KIPRJMOD)
+
+# 4.6.1
+* Fix compatibility with pypdfmium2 v5.0.0 #21
+
+# 4.6
+* Workspace display project with folder name
+* Differ display file path with folder name
+* Fix error in remove_tab() when the button is clicked again before the UI finishes refreshing #19
+* Allow specifying tab width individually #20
+* Implement dragging for manual tabs #20
+
+# 4.5.1
+* Fix memeory leak (in PUI) #16
+* Remove non-existed workspace file
+
+# 4.5
+* Bugfixes
+* UI/UX improvements
+* Preserve silkscreen text regardless of reference renaming
+
+# 4.4.1
+* Fix updating canvas when highlighting manual tab
+
+# 4.4
+* Panelizer
+    * Remove isolated substrates
+* Fix false conflicts in frames area when both X/Y frames are used
+* Speedup drawing board substrate
+* Workspace Manager
+    * Fix updating files list after creating new panelization
+
+# 4.3.2
+* Fix recalling project window
+* Fix bug in tabs management (PUI 0.19)
+
+# 4.3.1
+* Fix open panelizer in no-workspace context
+* Fix opening differ in no-workspace context
+
+# 4.3
+* Workspace Manager Allow Opening multiple workspaces
+* Differ Update rendering
+* Panelizer Update auto tabbing
+
+# 4.2.1
+* Fix kicad-cli pcb export pdf with KiCad v9.0.2
+
+# 4.2
+* Implement window recalling on windows
+* Rework macos window recalling improve PID finding, handle closed PID
+
+# 4.1
+* Fix subprocess.run on non-windows
+* Hide console when running kicad-cli on windows
+
+# 4.0
+* Rename to Kikakuka
+* Update kikit to 1.7.1
+* Update instruction with kicad v9
+* Workspace manager with window recalling on macOS
+* Differ with git support
+
+# 3.5
+* Add edge.cuts to v-cut output layer options #7
+* Implement v-cuts merging #8
+* Improve scrolling to zoom #9
+* Bugfixes
+
+# 3.4
+* Fix numerical error in V-Cut check
+* Add "None" cut method
+* Display components' version info
+* Codesign + notarize for macOS build
+
+# 3.3
+* Fix numerical error in oblique mousebites
+* Add a checkbox to toggle pcb display
+* Add a checkbox to toggle hole display
+* Add icon
+
+# 3.2
+* Support mousebites offset #5
+* Fix outward manual tab direction
+* Fix numerical error in making tabs
+
+# 3.1
+* Fix coordinate check for hide_outside_reference_value
+
+# 3.0
+* Manual tab
+* Autotabs find tabs to the interiors of substrates
+* Add net/ref renamer configs
+
+# 2.2
+* Add macOS build script
+* Add option for exporting mill fillets
+* Bundle files required for mousebites #1
+
+# 2.1
+* Add windows build script
+* Fix types arg for files dialogs
+
+# 2.0
+* Arbitrary rotation
+* Compact alignment by collision detection
+* Implement "Hide Out-of-Board References/Values"
+* Add vc+mb cut method
+
+# 1.0
+* Free-form arrangement
+* 90x rotation
+* Alignment by bounds
+* Hole
